@@ -1,0 +1,6 @@
+accelerate
+datasets
+Pillow
+pypinyin
+torch
+transformers
