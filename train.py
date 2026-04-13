@@ -1,28 +1,22 @@
 import argparse
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 from models.modeling_qwen3 import Qwen3ForCausalLM
+from models.configuration_qwen3 import Qwen3Config
 from models.data_collator import DataCollatorForCSC
 from models.encoder import InputHelper
-from trainer_csc import CSCTrainer, SaveAdapterCallback
 from datasets import load_dataset
 
 
 def train(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     plugin = Qwen3ForCausalLM.from_pretrained(args.model_name)
-
     input_helper = InputHelper(tokenizer=tokenizer, cache_dir=args.modal_cache_dir)
     dataset = load_dataset("json", data_files={"train": args.data_file})["train"]
     data_collator = DataCollatorForCSC(tokenizer, input_helper, max_length=args.max_length)
-    
-    # Freeze LLM backbone
-    # for param in plugin.model.parameters():
-    #     param.requires_grad = False
-
     # 冻结整个 Qwen3 主干
     for param in plugin.model.parameters():
         param.requires_grad = False
-    
+    # Optional: 解冻 Adapter 插入层后的层
     num_layers = len(plugin.model.layers)
     for layer_idx in range(args.plug_idx[0], num_layers):
         layer = plugin.model.layers[layer_idx]
@@ -30,23 +24,14 @@ def train(args):
             param.requires_grad = True
         for param in plugin.model.layers[layer_idx].parameters():
             param.requires_grad = True
-
-    # 解冻多模态组件
-    # for pidx in plugin.plug_idx:
-    #     module = plugin.model.layers[pidx].adapter
-    #     for param in module.parameters():
-    #         param.requires_grad = True
-    # for module in [plugin.phonetic, plugin.glyph]:
-    #     for param in module.parameters():
-    #         param.requires_grad = True
     for layer_idx in args.plug_idx:
         if hasattr(plugin.model.layers[layer_idx], 'csc_adapter'):
             for param in plugin.model.layers[layer_idx].csc_adapter.parameters():
                 param.requires_grad = True
-    trainable_params = [name for name, param in plugin.named_parameters() if param.requires_grad]
-    print("Trainable parameters:")
-    for name in trainable_params:
-        print(f"  - {name}")
+    # trainable_params = [name for name, param in plugin.named_parameters() if param.requires_grad]
+    # print("Trainable parameters:")
+    # for name in trainable_params:
+    #     print(f"  - {name}")
 
     # Training args
     training_args = TrainingArguments(
@@ -84,8 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B-Base", help="HuggingFace model name or path")
     parser.add_argument("--data_file", type=str, default="data/train.jsonl", help="Training data file")
     parser.add_argument("--modal_cache_dir", type=str, help="Cache directory to the mulitmodal embeddings")
-    parser.add_argument("--plug_idx", type=list, default=[16, 28], help="Layer indices to insert adapter")
-    parser.add_argument("--gate_type", type=str, default='residual')
+    parser.add_argument("--plug_idx", type=list, default=[28], help="Layer indices to insert adapter")
+    # parser.add_argument("--gate_type", type=str, default='residual')
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation steps")

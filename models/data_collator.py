@@ -1,40 +1,10 @@
-import torch
 import json
+import torch
 from typing import Dict, List
-from transformers import PreTrainedTokenizer
 from models.encoder import InputHelper
+from models.prompt import INS, INS2
+from transformers import PreTrainedTokenizer
 
-
-INS = """请检测待纠错句子中的中文拼写错误。
-
-**格式要求**
-- 输出句子中每处错误的位置(索引从0开始)，错字和正确字
-- 每项错误纠正间用换行符隔开
-- 如果没有错误，则输出"无错误"
-- 除此之外不要输出任何其他内容
-
----
-示例 1：
-*待纠错句子*：
-今天天汽真不搓。
-*纠错结果*：
-3, 汽, 气
-6, 搓, 错
-
-示例 2：
-*待纠错句子*：
-我要吃早惨。
-*纠错结果*：
-4, 惨, 餐
-
-示例 3：
-*待纠错句子*：
-今年是我的本命年。
-*纠错结果*：
-无错误
----
-现在请对以下句子进行纠错：
-"""
 
 class DataCollatorForCSC:
     def __init__(self, tokenizer: PreTrainedTokenizer, input_helper: InputHelper, max_length: int = 1024):
@@ -43,7 +13,7 @@ class DataCollatorForCSC:
         self.max_length = max_length
 
     def __call__(self, examples: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
-        prompts = [INS for ex in examples]
+        prompts = [INS2 for ex in examples]
         # prompts = INS
         src_texts = [ex["input"] for ex in examples]
         if isinstance(examples[0]["output"],(dict,list)):
