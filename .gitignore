@@ -1,1 +1,8 @@
 .vscode
+__pycache__
+
+predictions/
+output/
+
+LOG.md
+TODO.md
