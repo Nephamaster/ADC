@@ -164,9 +164,8 @@ def format_csc_input(original_text: str) -> str:
 def normalize_vllm_response(raw_text: str, fallback: str) -> str:
     response = raw_text.strip()
     answer_with_think = response.split("</think>")
-    if len(answer_with_think) < 2:
-        return fallback
-
+    # if len(answer_with_think) < 2:
+    #     return fallback
     pure_answer = answer_with_think[-1].strip()
     pure_answer = pure_answer.replace("\n", "")
     pure_answer = pure_answer.replace("*待纠错句子", "")
@@ -211,7 +210,7 @@ def run_csc_mode(
             max_length=args.max_length,
             device=device
         )
-        preds.append(pred)
+        preds.append(pred.replace('\n','').strip())
     return preds
 
 
@@ -282,7 +281,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     with open(args.dataset, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        if '.json' in args.dataset:
+            data = json.load(f)
+        elif '.txt' in args.dataset:
+            data = []
+            for line in f.readlines():
+                line = line.strip()
+                if line:
+                    data.append(line.split('\t')[0])
     dataset_groups = split_dataset_groups(data)
     is_grouped_input = isinstance(data, dict)
 
@@ -304,14 +310,13 @@ if __name__ == "__main__":
                 file_path = os.path.join(args.output, f"{dataset_name}.txt")
             else:
                 file_path = args.output
-            print(file_path)
             write_dataset_predictions(file_path, preds)
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         for dataset_name, samples in dataset_groups:
             preds = run_vllm_mode(args, samples, tokenizer)
             if is_grouped_input:
-                file_path = os.path.join(args.output, f"{dataset_name}.txt")
+                file_path = os.path.join(args.output, f"SFT_{dataset_name}.txt")
             else:
                 file_path = args.output
             write_dataset_predictions(file_path, preds)

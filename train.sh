@@ -8,9 +8,9 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
 MODEL_PATH="${MODEL_PATH:-/share/project/wuhaiming/spaces/ADC/charize/Qwen3-8B-Base-Char}"
-DATASET_PATH="${DATASET_PATH:-/share/project/wuhaiming/spaces/LlamaFactory/data/twnlp_csc.jsonl}"
+DATASET_PATH="${DATASET_PATH:-/share/project/wuhaiming/spaces/LlamaFactory/data/csc_mix_66err.jsonl}"
 CACHE_DIR="${CACHE_DIR:-/share/project/wuhaiming/spaces/ADC/cache/}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/Qwen3-8B-Char-Adapter-twnlp}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/Qwen3-8B-Char-Adapter-mix65}"
 PLUG_IDX="${PLUG_IDX:-28}"
 
 echo "[train.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"

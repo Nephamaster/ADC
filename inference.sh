@@ -1,8 +1,10 @@
-CUDA_VISIBLE_DEVICES=5 python inference.py \
-    --dataset evaluation/data/LEMON.json \
-    --cache ./cache/ \
+CUDA_VISIBLE_DEVICES=2 python inference.py \
+    --dataset evaluation/data/SIGHAN.json \
     --model ./outputs/Qwen3-8B-Char-Adapter-twnlp/checkpoint-11935 \
     --csc \
+    --cache ./cache/ \
+    # --csc \
+    # --cache ./cache/ \
     # --gpu_memory_utilization 0.9 \
-    # --model /share/project/wuhaiming/data/models/Qwen3-8B \
-    # --output predictions/ADC_char_layer28.jsonl \
+    # --model ./outputs/Qwen3-8B-Char-Adapter-twnlp/checkpoint-11935 \
+    # --model /share/project/wuhaiming/spaces/LlamaFactory/Nepham/saves/Qwen3/SFT/Adapter/Qwen3-8B-Base-SFT-twnlp/ \
