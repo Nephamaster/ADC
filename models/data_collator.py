@@ -1,9 +1,12 @@
 import json
 import torch
+
 from typing import Dict, List
+from transformers import PreTrainedTokenizer
+
 from models.encoder import InputHelper
 from models.prompt import INS, INS2
-from transformers import PreTrainedTokenizer
+
 
 
 class DataCollatorForCSC:
