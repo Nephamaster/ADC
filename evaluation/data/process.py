@@ -31,7 +31,7 @@ def process_pair(err_path:str, corr_path:str, output_path:str):
             f.write(e+'\t'+c+'\n')
 
 
-def combine(dir:str=None,dataset:str=None):
+def combine(dir:str,dataset:str=None):
     data = {}
     if dataset is not None:
         for fname in os.listdir(dir):
@@ -45,7 +45,7 @@ def combine(dir:str=None,dataset:str=None):
                     data[fname.replace('.txt','')] = lines
         with open(f'{dataset}.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    elif dir is not None:
+    else:
         for fname in os.listdir(dir):
             if '.txt' in fname:
                 lines = []
@@ -58,15 +58,15 @@ def combine(dir:str=None,dataset:str=None):
         with open('CSC_test.json', 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
-# process(
-#     'cscd-ns/test.tsv',
-#     'CSCD-NS.txt'
-# )
+process(
+    'cscd-ns/train.tsv',
+    'CSCD-NS-train.txt'
+)
 
 # process_pair(
-#     'SIGHAN/test15_error.txt',
-#     'SIGHAN/test15_correct.txt',
-#     'SIGHAN15.txt'
+#     'sighan/train13_error.txt',
+#     'sighan/train13_correct.txt',
+#     'SIGHAN13-train.txt'
 # )
 
-combine(dataset='LEMON')
+# combine(dataset='LEMON')
