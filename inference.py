@@ -9,7 +9,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from models.prompt import INS2
+from src.prompt import INS2
 
 
 @torch.no_grad()
@@ -178,8 +178,8 @@ def run_csc_mode(
     args: argparse.Namespace,
     data: List[str],
 ) -> List[str]:
-    from models.encoder import InputHelper
-    from models.modeling_qwen3 import Qwen3ForCausalLM
+    from src.encoder import InputHelper
+    from src.modeling_qwen3 import Qwen3ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -251,11 +251,11 @@ def run_vllm_mode(
     return preds
 
 
-def split_dataset_groups(data: Any) -> List[Tuple[str, List[str]]]:
+def split_dataset_groups(data: Any, data_file_name:str) -> List[Tuple[str, List[str]]]:
     if isinstance(data, dict):
         return [(name, list(samples)) for name, samples in data.items()]
     if isinstance(data, list):
-        return [("default", list(data))]
+        return [(data_file_name, list(data))]
     raise ValueError("Unsupported dataset format. Expected list or dict[str, list].")
 
 
@@ -270,7 +270,7 @@ if __name__ == "__main__":
     parser.add_argument("--csc", action="store_true")
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--cache", type=str, default=None)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
@@ -289,34 +289,21 @@ if __name__ == "__main__":
                 line = line.strip()
                 if line:
                     data.append(line.split('\t')[0])
-    dataset_groups = split_dataset_groups(data)
-    is_grouped_input = isinstance(data, dict)
+    data_file_name = args.dataset.split('/')[-1].replace('.jsonl','')
+    dataset_groups = split_dataset_groups(data, data_file_name)
 
-    if args.output is None:
-        args.output = "predictions" if is_grouped_input else "predictions/ADC.jsonl"
-    if is_grouped_input:
-        os.makedirs(args.output, exist_ok=True)
-    else:
-        output_dir = os.path.dirname(args.output)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(args.output, exist_ok=True)
 
     if args.csc:
         print('run csc mode')
         for dataset_name, samples in dataset_groups:
             print(f'Predicting {dataset_name}')
             preds = run_csc_mode(args, samples)
-            if is_grouped_input:
-                file_path = os.path.join(args.output, f"{dataset_name}.txt")
-            else:
-                file_path = args.output
+            file_path = os.path.join(args.output, f"{dataset_name}.txt")
             write_dataset_predictions(file_path, preds)
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         for dataset_name, samples in dataset_groups:
             preds = run_vllm_mode(args, samples, tokenizer)
-            if is_grouped_input:
-                file_path = os.path.join(args.output, f"SFT_{dataset_name}.txt")
-            else:
-                file_path = args.output
+            file_path = os.path.join(args.output, f"SFT_{dataset_name}.txt")
             write_dataset_predictions(file_path, preds)

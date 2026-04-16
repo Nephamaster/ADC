@@ -1,6 +1,7 @@
 CUDA_VISIBLE_DEVICES=2 python inference.py \
     --dataset evaluation/data/SIGHAN.json \
     --model ./outputs/Qwen3-8B-Char-Adapter-twnlp/checkpoint-11935 \
+    --output ./predictions/qwen3-8B-char-adapter-twnlp \
     --csc \
     --cache ./cache/ \
     # --csc \
