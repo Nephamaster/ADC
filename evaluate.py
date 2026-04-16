@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # encoding: utf-8
 # Adapted from: https://github.com/nghuyong/cscd-ime/blob/master/evaluation/evaluate.py
 
@@ -8,6 +8,8 @@ from string import punctuation
 from tqdm import tqdm
 from opencc import OpenCC
 
+IGNORE_REPLACE_CHAR = "\u0001"
+
 def calculate_metric_wang(src_sentences, tgt_sentences, pred_sentences, report_file=None, ignore_chars="", strict=True, epsilon=1e-8):
     TP = 0
     FP = 0
@@ -16,9 +18,9 @@ def calculate_metric_wang(src_sentences, tgt_sentences, pred_sentences, report_f
     all_gold_index = []
     for src, tgt, predict in zip(src_sentences, tgt_sentences, pred_sentences):
         for c in ignore_chars:
-            src = src.replace(c, "□")
-            tgt = tgt.replace(c, "□")
-            predict = predict.replace(c, "□")
+            src = src.replace(c, IGNORE_REPLACE_CHAR)
+            tgt = tgt.replace(c, IGNORE_REPLACE_CHAR)
+            predict = predict.replace(c, IGNORE_REPLACE_CHAR)
         gold_index = []
         each_true_index = []
         for i in range(len(list(src))):
@@ -62,15 +64,13 @@ def calculate_metric_wang(src_sentences, tgt_sentences, pred_sentences, report_f
         # we only detect those correctly detected location, which is a different from the common metrics since
         # we wanna to see the precision improve by using the confusionset
         if len(all_predict_true_index[i]) > 0:
-            predict_words = []
             for j in all_predict_true_index[i]:
-                predict_words.append(unions[i][2][j])
                 if unions[i][1][j] == unions[i][2][j]:
                     TP += 1
                 else:
                     FP += 1
             for j in all_gold_index[i]:
-                if unions[i][1][j]  in predict_words:
+                if j in all_predict_true_index[i] and unions[i][1][j] == unions[i][2][j]:
                     continue
                 else:
                     FN += 1
@@ -107,9 +107,9 @@ def calculate_metric_conventional(src_sentences, tgt_sentences, pred_sentences, 
 
     for src, tgt, pre in zip(src_sentences, tgt_sentences, pred_sentences):
         for c in ignore_chars:
-            src = src.replace(c, "□")
-            tgt = tgt.replace(c, "□")
-            pre = pre.replace(c, "□")
+            src = src.replace(c, IGNORE_REPLACE_CHAR)
+            tgt = tgt.replace(c, IGNORE_REPLACE_CHAR)
+            pre = pre.replace(c, IGNORE_REPLACE_CHAR)
         src = "".join(src.split())
         tgt = "".join(tgt.split())
         pre = "".join(pre.split())
@@ -209,9 +209,9 @@ def calculate_metric_official(src_sentences, tgt_sentences, pred_sentences, repo
     truth = []
     for index, (src, tgt, pre) in enumerate(zip(src_sentences, tgt_sentences, pred_sentences)):
         for c in ignore_chars:
-            src = src.replace(c, "□")
-            tgt = tgt.replace(c, "□")
-            pre = pre.replace(c, "□")
+            src = src.replace(c, IGNORE_REPLACE_CHAR)
+            tgt = tgt.replace(c, IGNORE_REPLACE_CHAR)
+            pre = pre.replace(c, IGNORE_REPLACE_CHAR)
         src = "".join(src.split())
         tgt = "".join(tgt.split())
         pre = "".join(pre.split())
@@ -381,9 +381,9 @@ def calculate_metric(src_sentences, tgt_sentences, pred_sentences, report_file=N
         if detect_indexes:
             sentence_detection['all_predict'] += 1
             sentence_correction['all_predict'] += 1
-            if tuple(true_error_indexes) == tuple(detect_indexes):
+            if true_error_indexes == detect_indexes:
                 sentence_detection['true_predict'] += 1
-            if tuple(true_error_edits) == tuple(detect_edits):
+            if true_error_edits == detect_edits:
                 sentence_correction['true_predict'] += 1
 
         origin_s = "".join(src_chars)
@@ -523,3 +523,4 @@ if __name__ == '__main__':
     if args.output is None:
         args.output = ".".join(args.hypo.split(".")[:-1]) + "_result.txt"
     main(args)
+

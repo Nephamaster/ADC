@@ -60,7 +60,7 @@ class Alignment:
                     l = costs.index(min(costs))
                     # Save the cost and the op in the matrices
                     cost_matrix[i + 1][j + 1] = costs[l]
-                    if l == 0: op_matrix[i + 1][j + 1] = "T" + str(k + 1)
+                    if l == 0: op_matrix[i + 1][j + 1] = "T1"
                     elif l == 1: op_matrix[i + 1][j + 1] = "S"
                     elif l == 2: op_matrix[i + 1][j + 1] = "I"
                     else: op_matrix[i + 1][j + 1] = "D"

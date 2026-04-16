@@ -18,7 +18,7 @@ do
 
     python evaluate.py \
         --gold data/${dataset}.txt \
-        --hypo ../predictions/${dataset}.txt \
+        --hypo predictions/${dataset}.txt \
         --metric_algorithm levenshtein \
 
     echo "Done $dataset"
