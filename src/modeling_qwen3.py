@@ -26,7 +26,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch import nn
 
-from models.configuration_qwen3 import Qwen3Config
+from src.configuration_qwen3 import Qwen3Config
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache

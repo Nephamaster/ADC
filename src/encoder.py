@@ -7,7 +7,7 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoTokenizer, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-from models.utils import convert_char_to_pinyin, convert_char_to_image, pred_token_process
+from src.utils import convert_char_to_pinyin, convert_char_to_image, pred_token_process
 from typing import List, Optional, Tuple
 
 

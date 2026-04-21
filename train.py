@@ -46,6 +46,7 @@ def train(args):
     )
     if hasattr(plugin, "config"):
         plugin.config.use_cache = args.use_cache
+        plugin.config.csc_adapter_layers = args.plug_idx
 
     input_helper = InputHelper(tokenizer=tokenizer, cache_dir=args.cache)
     dataset = load_dataset("json", data_files={"train": args.dataset})["train"]
@@ -59,7 +60,7 @@ def train(args):
         for param in plugin.model.layers[layer_idx].parameters():
             param.requires_grad = True
     for layer_idx in range(args.unfreeze_last_layers):
-        for param in plugin.model.layers[num_layers-layer_idx-1].parameters():
+        for param in plugin.model.layers[num_layers-layer_idx].parameters():
             param.requires_grad = True
 
     for layer_idx in args.plug_idx:

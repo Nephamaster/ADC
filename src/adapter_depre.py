@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
-from models.encoder import PhoneticEncoder, GlyphEncoder
+from src.encoder import PhoneticEncoder, GlyphEncoder
 from transformers.activations import ACT2FN
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3Config
 

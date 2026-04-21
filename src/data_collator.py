@@ -4,8 +4,8 @@ import torch
 from typing import Dict, List
 from transformers import PreTrainedTokenizer
 
-from models.encoder import InputHelper
-from models.prompt import INS, INS2
+from src.encoder import InputHelper
+from src.prompt import INS, INS2
 
 
 

@@ -4,9 +4,9 @@ import torch.nn.functional as F
 
 from typing import Callable, Optional, Tuple
 
-from models.encoder import PhoneticEncoder, GlyphEncoder
-from models.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv, Qwen3Attention, Qwen3RMSNorm
-from models.configuration_qwen3 import Qwen3Config
+from src.encoder import PhoneticEncoder, GlyphEncoder
+from src.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv, Qwen3Attention, Qwen3RMSNorm
+from src.configuration_qwen3 import Qwen3Config
 
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
