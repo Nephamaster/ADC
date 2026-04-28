@@ -24,7 +24,7 @@ def is_float(string):
 
 
 def convert_char_to_image(character, font_size=32):
-    font = ImageFont.truetype("/share/project/wuhaiming/spaces/ADC/models/ms_yahei.ttf", size=font_size)
+    font = ImageFont.truetype("src/ms_yahei.ttf", size=font_size)
 
     image = font.getmask(character)
     image = np.asarray(image).astype(np.float32).reshape(image.size[::-1])

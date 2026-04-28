@@ -102,7 +102,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
 
         self.use_csc_adapter = use_csc_adapter
-        self.csc_adapter_layers = csc_adapter_layers if csc_adapter_layers is not None else [28]
+        self.csc_adapter_layers = csc_adapter_layers if csc_adapter_layers is not None else [0]
         self.csc_adapter_dropout = csc_adapter_dropout
         self.csc_adapter_num_heads = csc_adapter_num_heads
 

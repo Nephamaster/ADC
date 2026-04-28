@@ -18,11 +18,11 @@ class DataCollatorForCSC:
     def __call__(self, examples: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         prompts = [INS2 for ex in examples]
         # prompts = INS
-        src_texts = [ex["input"] for ex in examples]
-        if isinstance(examples[0]["output"],(dict,list)):
-            tgt_texts = [json.dumps(ex["output"], ensure_ascii=False) + self.tokenizer.eos_token for ex in examples]
+        src_texts = [ex["src"] for ex in examples]
+        if isinstance(examples[0]["tgt"],(dict,list)):
+            tgt_texts = [json.dumps(ex["tgt"], ensure_ascii=False) + self.tokenizer.eos_token for ex in examples]
         else:
-            tgt_texts = [ex["output"] + self.tokenizer.eos_token for ex in examples]
+            tgt_texts = [ex["tgt"] + self.tokenizer.eos_token for ex in examples]
         full_texts = [p + s + t for p, s, t in zip(prompts, src_texts, tgt_texts)]
         prompt_len = len(self.tokenizer(prompts[0], add_special_tokens=False)["input_ids"])
 

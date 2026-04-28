@@ -10,6 +10,24 @@ from opencc import OpenCC
 
 IGNORE_REPLACE_CHAR = "\u0001"
 
+
+def normalize_prediction_text(text: str) -> str:
+    normalized = clean_text(text).strip()
+    if not normalized:
+        return normalized
+
+    if "</think>" in normalized:
+        normalized = normalized.split("</think>")[-1].strip()
+
+    prefixes = ("纠错后：", "纠错结果：", "输出：", "答案：", "result:", "answer:")
+    lowered = normalized.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            normalized = normalized[len(prefix):].strip()
+            break
+
+    return normalized.replace("\n", "").strip()
+
 def calculate_metric_wang(src_sentences, tgt_sentences, pred_sentences, report_file=None, ignore_chars="", strict=True, epsilon=1e-8):
     TP = 0
     FP = 0
@@ -466,7 +484,7 @@ def main(args):
         for idx, line in enumerate(f):
             if idx in ignored_indexes:
                 continue
-            prediction = clean_text(line).strip()
+            prediction = normalize_prediction_text(line)
             if args.to_simplified:
                 prediction = cc.convert(prediction)
             if args.to_halfwidth:
@@ -475,7 +493,12 @@ def main(args):
                 prediction = prediction.replace(" ", '')
             pred_sentences.append(prediction)
     if len(ignored_indexes) > 0:
-        print(f"Ingored {len(ignored_indexes)} instances")
+        print(f"Ignored {len(ignored_indexes)} instances")
+    if len(pred_sentences) != len(src_sentences):
+        raise ValueError(
+            f"Line count mismatch between gold and prediction after filtering: "
+            f"gold={len(src_sentences)}, pred={len(pred_sentences)}"
+        )
     chars_to_ignore = set(args.ignore_chars)
     if args.ignore_punct:
         chinese_punct = "！？｡＂＃＄％＆＇（）＊＋，－／：；＜＝＞＠［＼］＾＿｀｛｜｝～｟｠｢｣､、〃》「」『』【】〔〕〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘'‛“”„‟…‧﹏"

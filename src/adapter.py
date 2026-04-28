@@ -1,12 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from typing import Callable, Optional, Tuple
 
 from src.encoder import PhoneticEncoder, GlyphEncoder
-from src.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv, Qwen3Attention, Qwen3RMSNorm
-from src.configuration_qwen3 import Qwen3Config
+from src.modeling_qwen3_5 import apply_rotary_pos_emb, repeat_kv, Qwen3_5RMSNorm
+from src.configuration_qwen3_5 import Qwen3_5Config
 
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -40,7 +39,7 @@ def eager_attention_forward(
 class CrossAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3_5Config):
         super().__init__()
         self.config = config
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -61,8 +60,8 @@ class CrossAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
 
     def forward(
         self,
@@ -137,7 +136,7 @@ class CSCAdapter(nn.Module):
         self.glyph_encoder = GlyphEncoder(self.hidden_size, font_size=32, dropout=dropout)
         self.modal_fusion = nn.Sequential(
             nn.Linear(self.hidden_size*2, self.hidden_size, bias=False),
-            Qwen3RMSNorm(self.hidden_size, eps=config.rms_norm_eps),
+            Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps),
             ACT2FN[config.hidden_act],  # SwiGLU
             nn.Dropout(dropout),
         )
@@ -156,9 +155,9 @@ class CSCAdapter(nn.Module):
         self.cross_attention = CrossAttention(config=config)
 
         self.gate_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
-        self.gate_norm = Qwen3RMSNorm(self.hidden_size * 2, eps=config.rms_norm_eps)
-        self.norm1 = Qwen3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.norm2 = Qwen3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.gate_norm = Qwen3_5RMSNorm(self.hidden_size * 2, eps=config.rms_norm_eps)
+        self.norm1 = Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.norm2 = Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
     
     def forward(

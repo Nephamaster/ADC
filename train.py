@@ -7,7 +7,9 @@ from transformers import AutoTokenizer, Trainer, TrainingArguments
 
 from src.data_collator import DataCollatorForCSC
 from src.encoder import InputHelper
-from src.modeling_qwen3 import Qwen3ForCausalLM
+from src.modeling_qwen3_5 import Qwen3_5ForCausalLM
+from src.configuration_qwen_3_5 import Qwen3_5Config
+from src.adapter import CSCAdapter
 
 
 def is_main_process() -> bool:
@@ -36,17 +38,74 @@ def maybe_init_distributed(args) -> None:
     torch.distributed.init_process_group(backend=args.ddp_backend, init_method="env://")
 
 
+def normalize_layer_indices(indices, num_layers: int):
+    normalized = []
+    for idx in indices:
+        resolved_idx = idx if idx >= 0 else num_layers + idx
+        if resolved_idx < 0 or resolved_idx >= num_layers:
+            raise ValueError(f"Layer index out of range: {idx} (resolved={resolved_idx}, total={num_layers})")
+        if resolved_idx not in normalized:
+            normalized.append(resolved_idx)
+    return normalized
+
+
+def configure_csc_adapter(model, adapter_layers, use_cache: bool) -> None:
+    cfg = model.config
+    text_cfg = getattr(cfg, "text_config", None)
+
+    for target_cfg in (cfg, text_cfg):
+        if target_cfg is None:
+            continue
+        if hasattr(target_cfg, "use_cache"):
+            target_cfg.use_cache = use_cache
+        if hasattr(target_cfg, "use_csc_adapter"):
+            target_cfg.use_csc_adapter = True
+        if hasattr(target_cfg, "csc_adapter_layers"):
+            target_cfg.csc_adapter_layers = list(adapter_layers)
+
+
+def ensure_csc_adapters(model, adapter_layers) -> None:
+    adapter_layer_set = set(adapter_layers)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if layer_idx in adapter_layer_set:
+            if getattr(layer, "csc_adapter", None) is None:
+                layer.csc_adapter = CSCAdapter(
+                    config=model.config,
+                    num_heads=getattr(model.config, "csc_adapter_num_heads", 4),
+                    dropout=getattr(model.config, "csc_adapter_dropout", 0.1),
+                )
+            layer.use_csc_adapter = True
+            layer.csc_adapter_layer_idx = list(adapter_layers)
+        else:
+            if hasattr(layer, "csc_adapter") and layer.csc_adapter is not None:
+                layer.csc_adapter = None
+            layer.use_csc_adapter = False
+            layer.csc_adapter_layer_idx = list(adapter_layers)
+
+
 def train(args):
     maybe_init_distributed(args)
     log_distributed_env()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    plugin = Qwen3ForCausalLM.from_pretrained(
+    base_config = Qwen3_5Config.from_pretrained(args.model)
+    config_num_layers = getattr(base_config.text_config, "num_hidden_layers", None)
+    if config_num_layers is None:
+        raise ValueError("Cannot determine num_hidden_layers from Qwen3.5 config.")
+    adapter_layers = normalize_layer_indices(args.plug_idx, config_num_layers)
+    if hasattr(base_config, "text_config") and base_config.text_config is not None:
+        base_config.text_config.use_csc_adapter = True
+        base_config.text_config.csc_adapter_layers = list(adapter_layers)
+        base_config.text_config.use_cache = args.use_cache
+    base_config.use_cache = args.use_cache
+    plugin = Qwen3_5ForCausalLM.from_pretrained(
         args.model,
-        attn_implementation=args.attn_implementation,
+        config=base_config,
+        # attn_implementation=args.attn_implementation,
     )
-    if hasattr(plugin, "config"):
-        plugin.config.use_cache = args.use_cache
-        plugin.config.csc_adapter_layers = args.plug_idx
+    num_layers = len(plugin.model.layers)
+    adapter_layers = normalize_layer_indices(adapter_layers, num_layers)
+    configure_csc_adapter(plugin, adapter_layers, args.use_cache)
+    ensure_csc_adapters(plugin, adapter_layers)
 
     input_helper = InputHelper(tokenizer=tokenizer, cache_dir=args.cache)
     dataset = load_dataset("json", data_files={"train": args.dataset})["train"]
@@ -55,21 +114,20 @@ def train(args):
     for param in plugin.model.parameters():
         param.requires_grad = False
 
-    num_layers = len(plugin.model.layers)
-    for layer_idx in range(args.unfreeze_first_layers):
-        for param in plugin.model.layers[layer_idx].parameters():
-            param.requires_grad = True
-    for layer_idx in range(args.unfreeze_last_layers):
-        for param in plugin.model.layers[num_layers-layer_idx].parameters():
-            param.requires_grad = True
+    # for layer_idx in range(args.unfreeze_first_layers):
+    #     for param in plugin.model.layers[layer_idx].parameters():
+    #         param.requires_grad = True
+    # for layer_idx in range(args.unfreeze_last_layers):
+    #     for param in plugin.model.layers[-1*(layer_idx+1)].parameters():
+    #         param.requires_grad = True
 
-    for layer_idx in args.plug_idx:
+    for layer_idx in adapter_layers:
         layer = plugin.model.layers[layer_idx]
-        if hasattr(layer, "csc_adapter"):
+        if getattr(layer, "csc_adapter", None) is not None:
             for param in layer.csc_adapter.parameters():
                 param.requires_grad = True
-            for param in layer.mlp.parameters():
-                param.requires_grad = True
+            # for param in layer.mlp.parameters():
+            #     param.requires_grad = True
 
     use_bf16 = args.bf16 and torch.cuda.is_available()
     use_fp16 = args.fp16 and torch.cuda.is_available()
@@ -120,11 +178,11 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="data/train.jsonl", help="Training data file")
     parser.add_argument("--cache", type=str, help="Cache directory to the mulitmodal embeddings")
     parser.add_argument("--output", type=str, default="./qwen3-csc-adapter", help="Directory to save Adapter")
-    parser.add_argument("--plug_idx", nargs="+", type=int, default=[28], help="Layer indices to insert adapter")
+    parser.add_argument("--plug_idx", nargs="+", type=int, default=[2,-2], help="Layer indices to insert adapter")
     parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=1, help="Batch size per device")
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Gradient accumulation steps")
-    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
     parser.add_argument("--save_total_limit", type=int, default=6, help="Maximum number of checkpoints to save")
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")

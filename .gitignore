@@ -3,6 +3,7 @@ __pycache__
 
 predictions/
 outputs/
+migration/
 
 LOG.md
 TODO.md

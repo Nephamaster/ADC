@@ -10,6 +10,54 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from src.prompt import INS2
+from src.configuration_qwen_3_5 import Qwen3_5Config
+
+
+def normalize_layer_indices(indices, num_layers: int) -> List[int]:
+    normalized: List[int] = []
+    for idx in indices:
+        resolved_idx = idx if idx >= 0 else num_layers + idx
+        if resolved_idx < 0 or resolved_idx >= num_layers:
+            raise ValueError(f"Layer index out of range: {idx} (resolved={resolved_idx}, total={num_layers})")
+        if resolved_idx not in normalized:
+            normalized.append(resolved_idx)
+    return normalized
+
+
+def configure_csc_adapter(model, adapter_layers: Sequence[int], use_cache: bool) -> None:
+    cfg = model.config
+    text_cfg = getattr(cfg, "text_config", None)
+
+    for target_cfg in (cfg, text_cfg):
+        if target_cfg is None:
+            continue
+        if hasattr(target_cfg, "use_cache"):
+            target_cfg.use_cache = use_cache
+        if hasattr(target_cfg, "use_csc_adapter"):
+            target_cfg.use_csc_adapter = True
+        if hasattr(target_cfg, "csc_adapter_layers"):
+            target_cfg.csc_adapter_layers = list(adapter_layers)
+
+
+def ensure_csc_adapters(model, adapter_layers: Sequence[int]) -> None:
+    from src.adapter import CSCAdapter
+
+    adapter_layer_set = set(adapter_layers)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if layer_idx in adapter_layer_set:
+            if getattr(layer, "csc_adapter", None) is None:
+                layer.csc_adapter = CSCAdapter(
+                    config=model.config,
+                    num_heads=getattr(model.config, "csc_adapter_num_heads", 4),
+                    dropout=getattr(model.config, "csc_adapter_dropout", 0.1),
+                )
+            layer.use_csc_adapter = True
+            layer.csc_adapter_layer_idx = list(adapter_layers)
+        else:
+            if hasattr(layer, "csc_adapter") and layer.csc_adapter is not None:
+                layer.csc_adapter = None
+            layer.use_csc_adapter = False
+            layer.csc_adapter_layer_idx = list(adapter_layers)
 
 
 @torch.no_grad()
@@ -179,7 +227,7 @@ def run_csc_mode(
     data: List[str],
 ) -> List[str]:
     from src.encoder import InputHelper
-    from src.modeling_qwen3 import Qwen3ForCausalLM
+    from src.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -187,11 +235,28 @@ def run_csc_mode(
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    model = Qwen3ForCausalLM.from_pretrained(
+    base_config = Qwen3_5Config.from_pretrained(args.model)
+    config_num_layers = getattr(base_config.text_config, "num_hidden_layers", None)
+    if config_num_layers is None:
+        raise ValueError("Cannot determine num_hidden_layers from Qwen3.5 config.")
+    adapter_layers = normalize_layer_indices(args.plug_idx, config_num_layers)
+    if hasattr(base_config, "text_config") and base_config.text_config is not None:
+        base_config.text_config.use_csc_adapter = True
+        base_config.text_config.csc_adapter_layers = list(adapter_layers)
+        base_config.text_config.use_cache = args.use_cache
+    base_config.use_cache = args.use_cache
+    load_kwargs = {"trust_remote_code": True, "attn_implementation": args.attn_implementation}
+    if torch.cuda.is_available():
+        load_kwargs["device_map"] = "auto"
+    model = Qwen3_5ForCausalLM.from_pretrained(
         args.model,
-        device_map="cuda" if torch.cuda.is_available() else "cpu",
-        trust_remote_code=True,
-    ).eval()
+        config=base_config,
+        **load_kwargs,
+    )
+    adapter_layers = normalize_layer_indices(adapter_layers, len(model.model.layers))
+    configure_csc_adapter(model, adapter_layers, args.use_cache)
+    ensure_csc_adapters(model, adapter_layers)
+    model = model.eval()
     input_helper = InputHelper(
         tokenizer,
         cache_dir=args.cache or os.path.join(model.config.name_or_path, "cache"),
@@ -278,6 +343,20 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--plug_idx", nargs="+", type=int, default=[28], help="Layer indices to use CSC adapter")
+    parser.add_argument(
+        "--use_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to use KV cache during generation",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        help="Attention implementation",
+    )
     args = parser.parse_args()
 
     with open(args.dataset, "r", encoding="utf-8") as f:
