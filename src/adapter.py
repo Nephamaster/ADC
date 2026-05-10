@@ -37,7 +37,7 @@ def eager_attention_forward(
 
 
 class CrossAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
+    """Qwen3.5-style gated full attention, with KV from multimodal features."""
 
     def __init__(self, config: Qwen3_5Config):
         super().__init__()
@@ -49,7 +49,7 @@ class CrossAttention(nn.Module):
         self.is_causal = True
 
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
@@ -74,7 +74,12 @@ class CrossAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_states, gate = torch.chunk(
+            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+        )
+        gate = gate.reshape(*input_shape, -1)
+
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(multimodal_feature).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(multimodal_feature).view(hidden_shape).transpose(1, 2)
 
@@ -119,6 +124,7 @@ class CrossAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -140,24 +146,11 @@ class CSCAdapter(nn.Module):
             ACT2FN[config.hidden_act],  # SwiGLU
             nn.Dropout(dropout),
         )
-
-        # encoder_layer = nn.TransformerEncoderLayer(
-        #     d_model=self.hidden_size,
-        #     nhead=num_heads,
-        #     dim_feedforward=self.hidden_size * 2,
-        #     dropout=dropout,
-        #     activation=ACT2FN[config.hidden_act],
-        #     batch_first=True,
-        #     norm_first=True,
-        # )
-        # self.fusion_transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
-
         self.cross_attention = CrossAttention(config=config)
 
         self.gate_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         self.gate_norm = Qwen3_5RMSNorm(self.hidden_size * 2, eps=config.rms_norm_eps)
         self.norm1 = Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.norm2 = Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
     
     def forward(
@@ -181,42 +174,12 @@ class CSCAdapter(nn.Module):
         if seq_len == 1:
             return hidden_states
         residual = hidden_states
-        # if phonetic_features is not None and phonetic_features.shape[1] != seq_len:
-        #     diff = seq_len - phonetic_features.shape[1]
-        #     if diff > 0:
-        #         phonetic_features = F.pad(phonetic_features, (0, 0, 0, diff))
-        #     else:
-        #         phonetic_features = phonetic_features[:, :seq_len, :]
-        # if glyph_features is not None and glyph_features.shape[1] != seq_len:
-        #     diff = seq_len - glyph_features.shape[1]
-        #     if diff > 0:
-        #         glyph_features = F.pad(glyph_features, (0, 0, 0, 0, 0, diff))
-        #     else:
-        #         glyph_features = glyph_features[:, :seq_len, :, :]
-        
+
         phonetic_emb = self.phonetic_encoder(phonetic_features)  # [batch, seq_len, hidden_size]
         glyph_emb = self.glyph_encoder(glyph_features)  # [batch, seq_len, hidden_size]
         
         multimodal_feature = torch.cat([phonetic_emb, glyph_emb], dim=-1)
         multimodal_feature = self.modal_fusion(multimodal_feature)
-        
-        # 3. Transformer增强上下文
-        # 转换attention_mask为Transformer格式（True=padding）
-        # transformer_mask = None
-        # if attention_mask is not None:
-        #     # 确保是 2-D
-        #     if attention_mask.dim() > 2:
-        #         # 如果维度不对，尝试压缩
-        #         attention_mask = attention_mask.view(batch_size, seq_len)
-        #     if attention_mask.dtype == torch.bool:
-        #         transformer_mask = ~attention_mask
-        #     else:
-        #         transformer_mask = (attention_mask == 0).bool()
-            
-        # multimodal_feat = self.fusion_transformer(
-        #     multimodal_feat, 
-        #     src_key_padding_mask=transformer_mask
-        # )
         
         hidden_states_norm = self.norm1(hidden_states)
         attn_output, _ = self.cross_attention(
@@ -225,11 +188,10 @@ class CSCAdapter(nn.Module):
             position_embeddings=position_embeddings,
             attention_mask=padding_mask
         )
-        attn_output = self.dropout(attn_output) + residual
+        attn_output = self.dropout(attn_output)
         
         gate_input = self.gate_norm(torch.cat([residual, attn_output], dim=-1))
         gate_weight = torch.sigmoid(self.gate_proj(gate_input))
-        output = gate_weight * attn_output + (1 - gate_weight) * residual
-        output = self.norm2(output)
+        output = residual + gate_weight * attn_output
         
         return output

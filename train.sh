@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-MODEL_PATH="${MODEL_PATH:-./checkpoints/Qwen3.5-9B-Base-34M}"
-# MODEL_PATH="${MODEL_PATH:-../../data/models/Qwen3.5-9B-Base}"
-DATASET_PATH="${DATASET_PATH:-./data/train/csc_mix.jsonl}"
+# MODEL_PATH="${MODEL_PATH:-./checkpoints/Qwen3.5-9B-Base-34M}"
+# MODEL_PATH="${MODEL_PATH:-../../models/Qwen3.5-9B-Base}"
+MODEL_PATH="${MODEL_PATH:-charize/Qwen3.5-9B-Base-Char}"
+DATASET_PATH="${DATASET_PATH:-./data/train/34m_mix.jsonl}"
 CACHE_DIR="${CACHE_DIR:-./cache}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/Qwen3.5-9B-Adapter-CSCMIX}"
-PLUG_IDX="${PLUG_IDX:--4}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/Qwen3.5-9B-Base-Char-Adapter-SFT-CSCMIX}"
+PLUG_IDX="${PLUG_IDX:-27}"
 LEARNING_RATE="${LEARNING_RATE:-7e-5}"
 UNFREEZE_FIRST_LAYERS="${UNFREEZE_FIRST_LAYERS:-0}"
 UNFREEZE_LAST_LAYERS="${UNFREEZE_LAST_LAYERS:-1}"
 
-echo "[train.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "[train.sh] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}"
 echo "[train.sh] NPROC_PER_NODE=${NPROC_PER_NODE} NNODES=${NNODES}"
 
 if [[ "${NNODES}" == "1" ]]; then

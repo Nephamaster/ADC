@@ -99,9 +99,13 @@ def train(args):
     base_config.use_cache = args.use_cache
     plugin = Qwen3_5ForCausalLM.from_pretrained(
         args.model,
-        config=base_config,
+        # config=base_config,
         # attn_implementation=args.attn_implementation,
     )
+    if hasattr(plugin.config, "text_config") and plugin.config.text_config is not None:
+        plugin.config.text_config.use_csc_adapter = True
+        plugin.config.text_config.csc_adapter_layers = list(adapter_layers)
+        plugin.config.text_config.use_cache = args.use_cache
     num_layers = len(plugin.model.layers)
     adapter_layers = normalize_layer_indices(adapter_layers, num_layers)
     configure_csc_adapter(plugin, adapter_layers, args.use_cache)
@@ -111,23 +115,25 @@ def train(args):
     dataset = load_dataset("json", data_files={"train": args.dataset})["train"]
     data_collator = DataCollatorForCSC(tokenizer, input_helper, max_length=args.max_length)
 
-    for param in plugin.model.parameters():
-        param.requires_grad = False
+    # for param in plugin.model.parameters():
+    #     param.requires_grad = False
+    # for param in plugin.parameters():
+    #     param.requires_grad = False
 
     # for layer_idx in range(args.unfreeze_first_layers):
     #     for param in plugin.model.layers[layer_idx].parameters():
     #         param.requires_grad = True
     # for layer_idx in range(args.unfreeze_last_layers):
-    #     for param in plugin.model.layers[-1*(layer_idx+1)].parameters():
+    #     for param in plugin.model.layers[-1*(layer_idx)].parameters():
     #         param.requires_grad = True
 
-    for layer_idx in adapter_layers:
-        layer = plugin.model.layers[layer_idx]
-        if getattr(layer, "csc_adapter", None) is not None:
-            for param in layer.csc_adapter.parameters():
-                param.requires_grad = True
-            # for param in layer.mlp.parameters():
-            #     param.requires_grad = True
+    # for layer_idx in adapter_layers:
+    #     layer = plugin.model.layers[layer_idx]
+    #     if getattr(layer, "csc_adapter", None) is not None:
+    #         for param in layer.csc_adapter.parameters():
+    #             param.requires_grad = True
+    #         for param in layer.mlp.parameters():
+    #             param.requires_grad = True
 
     use_bf16 = args.bf16 and torch.cuda.is_available()
     use_fp16 = args.fp16 and torch.cuda.is_available()
@@ -175,64 +181,29 @@ def train(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B-Base", help="HuggingFace model name or path")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
     parser.add_argument("--dataset", type=str, default="data/train.jsonl", help="Training data file")
     parser.add_argument("--cache", type=str, help="Cache directory to the mulitmodal embeddings")
+    parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Number of workers for dataloader")
     parser.add_argument("--output", type=str, default="./qwen3-csc-adapter", help="Directory to save Adapter")
-    parser.add_argument("--plug_idx", nargs="+", type=int, default=[2,-2], help="Layer indices to insert adapter")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--plug_idx", nargs="+", type=int, default=[0,-1], help="Layer indices to insert adapter")
+    parser.add_argument("--unfreeze_first_layers", type=int, default=0, help="Number of first transformer layers to unfreeze")
+    parser.add_argument("--unfreeze_last_layers", type=int, default=1, help="Number of last transformer layers to unfreeze")
+    parser.add_argument("--learning_rate", type=float, default=7e-5, help="Learning rate")
+    parser.add_argument("--optim", type=str, default="paged_adamw_8bit", help="Optimizer type passed to TrainingArguments")
     parser.add_argument("--per_device_train_batch_size", type=int, default=4, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=16, help="Gradient accumulation steps")
-    parser.add_argument("--logging_steps", type=int, default=1)
-    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
-    parser.add_argument("--save_total_limit", type=int, default=6, help="Maximum number of checkpoints to save")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
-    parser.add_argument("--learning_rate", type=float, default=7e-5, help="Learning rate")
-    parser.add_argument("--dataloader_num_workers", type=int, default=4, help="Number of workers for dataloader")
+    parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True, help="Enable gradient checkpointing")
+    parser.add_argument("--use_cache", action=argparse.BooleanOptionalAction, default=False, help="Whether to use KV cache during training")
+    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2", choices=["flash_attention_2", "sdpa", "eager"], help="Attention implementation")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--warmup_steps", type=int, default=500, help="Warmup steps")
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every N steps")
+    parser.add_argument("--save_total_limit", type=int, default=5, help="Maximum number of checkpoints to save")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True, help="Enable bf16 mixed precision")
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=False, help="Enable fp16 mixed precision")
-    parser.add_argument(
-        "--gradient_checkpointing",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable gradient checkpointing",
-    )
-    parser.add_argument(
-        "--use_cache",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Whether to use KV cache during training",
-    )
-    parser.add_argument(
-        "--attn_implementation",
-        type=str,
-        default="flash_attention_2",
-        choices=["flash_attention_2", "sdpa", "eager"],
-        help="Attention implementation",
-    )
-    parser.add_argument(
-        "--optim",
-        type=str,
-        default="paged_adamw_8bit",
-        help="Optimizer type passed to TrainingArguments",
-    )
-    parser.add_argument(
-        "--unfreeze_first_layers",
-        type=int,
-        default=0,
-        help="Number of first transformer layers to unfreeze",
-    )
-    parser.add_argument(
-        "--unfreeze_last_layers",
-        type=int,
-        default=2,
-        help="Number of last transformer layers to unfreeze",
-    )
-    parser.add_argument(
-        "--ddp_find_unused_parameters",
-        action="store_true",
-        help="Enable when DDP raises unused-parameters errors",
-    )
+    parser.add_argument("--ddp_find_unused_parameters", action="store_true", help="Enable when DDP raises unused-parameters errors")
     parser.add_argument("--ddp_backend", type=str, default="nccl", help="DDP backend, e.g., nccl/gloo")
     parser.add_argument("--deepspeed", type=str, default=None, help="Path to deepspeed config json")
     return parser.parse_args()

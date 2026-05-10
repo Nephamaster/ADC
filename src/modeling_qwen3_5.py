@@ -344,7 +344,7 @@ class Qwen3_5Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        # cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -363,8 +363,8 @@ class Qwen3_5Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)#, cache_kwargs)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -595,9 +595,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # cache_params: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        cache_params: Qwen3_5DynamicCache | None = None,
+        cache_params: Cache | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -608,7 +606,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cache_params is not None
             and cache_params.has_previous_state
             and seq_len == 1
-            and cache_position is not None
         )
         
         if cache_params is not None:
@@ -739,7 +736,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
+        # cache_position: torch.LongTensor | None = None,
         phonetic_features: torch.Tensor | None = None,
         glyph_features: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
@@ -752,7 +749,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
-                cache_position=cache_position,
+                # cache_position=cache_position,
                 attention_mask=attention_mask,
             )
         elif self.layer_type == "full_attention":
@@ -761,7 +758,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
+                # cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -855,7 +852,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
+        # cache_position: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
@@ -879,31 +876,24 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = Qwen3_5DynamicCache(config=self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens,
-                past_seen_tokens + inputs_embeds.shape[1],
-                device=inputs_embeds.device,
-            )
-        # if position_ids is None:
-        #     past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        #     position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-        #     position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
-        # elif position_ids.ndim == 2:
-        #     position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
-
-        # if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-        #     text_position_ids = position_ids[0]
-        #     rope_position_ids = position_ids[1:]
         if position_ids is None:
-            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
-            position_ids = position_ids[1:]
+            rope_position_ids = position_ids[1:]
+        # if position_ids is None:
+        #     position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+        # elif position_ids.ndim == 2:
+        #     position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+        # if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        #     text_position_ids = position_ids[0]
+        #     position_ids = position_ids[1:]
         else:
             raise ValueError("Qwen3.5 text model expects 2D position ids or a [4, batch, seq] tensor.")
 
@@ -915,7 +905,15 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 padding_mask = attention_mask[:, 0, 0, :].bool()
             else:
                 padding_mask = attention_mask.bool() if attention_mask.dtype != torch.bool else attention_mask
+        
 
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        )
+        
         try:
             causal_mask = create_causal_mask(
                 config=self.config,
@@ -934,11 +932,11 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 past_key_values=past_key_values,
                 position_ids=text_position_ids,
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)#, cache_position)
 
         hidden_states = inputs_embeds
-        # position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
@@ -952,7 +950,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 glyph_features=glyph_features,
                 padding_mask=padding_mask,
                 use_cache=use_cache,
-                cache_position=cache_position,
+                # cache_position=cache_position,
                 **kwargs,
             )
 
@@ -962,12 +960,10 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, past_key_values, cache_position):
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
         linear_attn_mask = attention_mask
-        
-        if cache_position is not None and (cache_position[0] > 0 or (attention_mask is not None and torch.all(attention_mask == 1))):
-            linear_attn_mask = None
-        elif (past_key_values is not None and past_key_values.has_previous_state()) or (
+
+        if (past_key_values is not None and past_key_values.has_previous_state()) or (
             attention_mask is not None and torch.all(attention_mask == 1)
         ):
             linear_attn_mask = None
@@ -1014,7 +1010,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        cache_position: torch.LongTensor | None = None,
+        # cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         phonetic_features: torch.Tensor | None = None,
         glyph_features: torch.Tensor | None = None,
@@ -1049,7 +1045,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            cache_position=cache_position,
+            # cache_position=cache_position,
             phonetic_features=phonetic_features,
             glyph_features=glyph_features,
             **kwargs,

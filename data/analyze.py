@@ -24,5 +24,9 @@ def count_err(input_path:str):
                     total += 1
     print('Error Ratio:', error*1.0/total)
 
-count_err('../../../LlamaFactory/data/csc_mix.jsonl')
+def count_num(input_path:str):
+    with open(input_path, 'r', encoding='utf-8') as f:
+        print(len(f.readlines()))
+        
 # count_err('CSCD-NS-train.txt')
+count_num('train/csc_train.jsonl')

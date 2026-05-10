@@ -245,9 +245,9 @@ def run_csc_mode(
         base_config.text_config.csc_adapter_layers = list(adapter_layers)
         base_config.text_config.use_cache = args.use_cache
     base_config.use_cache = args.use_cache
-    load_kwargs = {"trust_remote_code": True, "attn_implementation": args.attn_implementation}
+    load_kwargs = {"trust_remote_code": True}#, "attn_implementation": args.attn_implementation}
     if torch.cuda.is_available():
-        load_kwargs["device_map"] = "auto"
+        load_kwargs["device_map"] = "cuda"
     model = Qwen3_5ForCausalLM.from_pretrained(
         args.model,
         config=base_config,
@@ -262,6 +262,7 @@ def run_csc_mode(
         cache_dir=args.cache or os.path.join(model.config.name_or_path, "cache"),
     )
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
 
     preds = []
     for term in tqdm(data, desc="Correcting...", ncols=100):
@@ -343,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--plug_idx", nargs="+", type=int, default=[28], help="Layer indices to use CSC adapter")
+    parser.add_argument("--plug_idx", nargs="+", type=int, default=[27], help="Layer indices to use CSC adapter")
     parser.add_argument(
         "--use_cache",
         action=argparse.BooleanOptionalAction,

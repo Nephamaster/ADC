@@ -56,7 +56,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
         pad_token_id: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
-        use_csc_adapter: bool = True,
+        use_csc_adapter: bool = False,
         csc_adapter_layers: list[int] | None = None,
         csc_adapter_dropout: float = 0.1,
         csc_adapter_num_heads: int = 4,
@@ -102,7 +102,7 @@ class Qwen3_5TextConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
 
         self.use_csc_adapter = use_csc_adapter
-        self.csc_adapter_layers = csc_adapter_layers if csc_adapter_layers is not None else [0]
+        self.csc_adapter_layers = csc_adapter_layers
         self.csc_adapter_dropout = csc_adapter_dropout
         self.csc_adapter_num_heads = csc_adapter_num_heads
 
