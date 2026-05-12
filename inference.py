@@ -1,63 +1,37 @@
 import argparse
 import json
-import multiprocessing as mp
 import os
-import tempfile
 from typing import Any, List, Sequence, Tuple
 
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+from src.csc_config import load_csc_config
 from src.prompt import INS2
-from src.configuration_qwen_3_5 import Qwen3_5Config
 
 
-def normalize_layer_indices(indices, num_layers: int) -> List[int]:
-    normalized: List[int] = []
-    for idx in indices:
-        resolved_idx = idx if idx >= 0 else num_layers + idx
-        if resolved_idx < 0 or resolved_idx >= num_layers:
-            raise ValueError(f"Layer index out of range: {idx} (resolved={resolved_idx}, total={num_layers})")
-        if resolved_idx not in normalized:
-            normalized.append(resolved_idx)
-    return normalized
+IM_START = "<|im_start|>"
+IM_END = "<|im_end|>"
+NON_THINKING_PREFIX = "<think>\n\n</think>\n\n"
 
 
-def configure_csc_adapter(model, adapter_layers: Sequence[int], use_cache: bool) -> None:
-    cfg = model.config
-    text_cfg = getattr(cfg, "text_config", None)
-
-    for target_cfg in (cfg, text_cfg):
-        if target_cfg is None:
-            continue
-        if hasattr(target_cfg, "use_cache"):
-            target_cfg.use_cache = use_cache
-        if hasattr(target_cfg, "use_csc_adapter"):
-            target_cfg.use_csc_adapter = True
-        if hasattr(target_cfg, "csc_adapter_layers"):
-            target_cfg.csc_adapter_layers = list(adapter_layers)
+def format_csc_chat_prefix(instruction: str) -> str:
+    return f"{IM_START}system\n{instruction}{IM_END}\n{IM_START}user\n"
 
 
-def ensure_csc_adapters(model, adapter_layers: Sequence[int]) -> None:
-    from src.adapter import CSCAdapter
+def format_csc_chat_prompt(instruction: str, src_text: str) -> str:
+    return f"{format_csc_chat_prefix(instruction)}{src_text}{IM_END}\n{IM_START}assistant\n{NON_THINKING_PREFIX}"
 
-    adapter_layer_set = set(adapter_layers)
-    for layer_idx, layer in enumerate(model.model.layers):
-        if layer_idx in adapter_layer_set:
-            if getattr(layer, "csc_adapter", None) is None:
-                layer.csc_adapter = CSCAdapter(
-                    config=model.config,
-                    num_heads=getattr(model.config, "csc_adapter_num_heads", 4),
-                    dropout=getattr(model.config, "csc_adapter_dropout", 0.1),
-                )
-            layer.use_csc_adapter = True
-            layer.csc_adapter_layer_idx = list(adapter_layers)
-        else:
-            if hasattr(layer, "csc_adapter") and layer.csc_adapter is not None:
-                layer.csc_adapter = None
-            layer.use_csc_adapter = False
-            layer.csc_adapter_layer_idx = list(adapter_layers)
+
+def get_csc_eos_token_ids(tokenizer):
+    eos_ids = []
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(tokenizer.eos_token_id)
+    im_end_id = tokenizer.convert_tokens_to_ids(IM_END)
+    if isinstance(im_end_id, int) and im_end_id >= 0 and im_end_id not in eos_ids:
+        eos_ids.append(im_end_id)
+    return eos_ids or None
 
 
 @torch.no_grad()
@@ -70,7 +44,7 @@ def inference_csc(
     max_length: int = 2048,
     device: str = "cuda"
 ): 
-    full_texts = instruction + src_text
+    full_texts = format_csc_chat_prompt(instruction, src_text)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenized = tokenizer(
@@ -83,7 +57,7 @@ def inference_csc(
     input_ids = tokenized["input_ids"]
     attention_mask = tokenized["attention_mask"]
     batch_size, seq_len = input_ids.shape
-    prompt_len = len(tokenizer(instruction, add_special_tokens=False).input_ids)
+    prefix_len = len(tokenizer(format_csc_chat_prefix(instruction), add_special_tokens=False).input_ids)
     # 与 input_ids 同形状
     pinyins = torch.zeros((batch_size, seq_len, 6), dtype=torch.long, device=device)
     images = torch.zeros((batch_size, seq_len, 32, 32), dtype=torch.float32, device=device)
@@ -93,8 +67,8 @@ def inference_csc(
         has_bos = (tokenizer.bos_token_id is not None 
                 and input_ids[i, 0].item() == tokenizer.bos_token_id)
         bos_offset = 1 if has_bos else 0
-        src_start = bos_offset + prompt_len
-        src_end = min(bos_offset + prompt_len + src_len, seq_len)
+        src_start = bos_offset + prefix_len
+        src_end = min(src_start + src_len, seq_len)
         if src_start >= src_end:
             continue
         src_token_ids = input_ids[i, src_start:src_end]
@@ -112,7 +86,7 @@ def inference_csc(
         do_sample=False,
         repetition_penalty=1.1,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=get_csc_eos_token_ids(tokenizer),
     )
     response = tokenizer.decode(generated_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
     return response.strip()
@@ -133,7 +107,7 @@ def inference_csc_batch(
     if not src_texts:
         return []
 
-    full_texts = [instruction + src_text for src_text in src_texts]
+    full_texts = [format_csc_chat_prompt(instruction, src_text) for src_text in src_texts]
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -147,7 +121,7 @@ def inference_csc_batch(
     input_ids = tokenized["input_ids"]
     attention_mask = tokenized["attention_mask"]
     batch_size, seq_len = input_ids.shape
-    prompt_len = len(tokenizer(instruction, add_special_tokens=False).input_ids)
+    prefix_len = len(tokenizer(format_csc_chat_prefix(instruction), add_special_tokens=False).input_ids)
     src_lens = [len(tokenizer(src_text, add_special_tokens=False).input_ids) for src_text in src_texts]
 
     pinyins = torch.zeros((batch_size, seq_len, 6), dtype=torch.long, device=device)
@@ -157,8 +131,8 @@ def inference_csc_batch(
         src_len = src_lens[i]
         has_bos = (tokenizer.bos_token_id is not None and input_ids[i, 0].item() == tokenizer.bos_token_id)
         bos_offset = 1 if has_bos else 0
-        src_start = bos_offset + prompt_len
-        src_end = min(bos_offset + prompt_len + src_len, seq_len)
+        src_start = bos_offset + prefix_len
+        src_end = min(src_start + src_len, seq_len)
         if src_start >= src_end:
             continue
         src_token_ids = input_ids[i, src_start:src_end]
@@ -179,7 +153,7 @@ def inference_csc_batch(
                 do_sample=False,
                 repetition_penalty=1.1,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=get_csc_eos_token_ids(tokenizer),
             )
     else:
         generated_ids = model.generate(
@@ -191,7 +165,7 @@ def inference_csc_batch(
             do_sample=False,
             repetition_penalty=1.1,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=get_csc_eos_token_ids(tokenizer),
         )
 
     input_len = input_ids.shape[1]
@@ -201,14 +175,6 @@ def inference_csc_batch(
     ]
 
 
-CSC_INPUT_PREFIX = "*待纠错句子*：\n"
-CSC_INPUT_SUFFIX = "\n*正确句子*：\n"
-
-
-def format_csc_input(original_text: str) -> str:
-    return f"{CSC_INPUT_PREFIX}{original_text}{CSC_INPUT_SUFFIX}"
-
-
 def normalize_vllm_response(raw_text: str, fallback: str) -> str:
     response = raw_text.strip()
     answer_with_think = response.split("</think>")
@@ -216,9 +182,6 @@ def normalize_vllm_response(raw_text: str, fallback: str) -> str:
     #     return fallback
     pure_answer = answer_with_think[-1].strip()
     pure_answer = pure_answer.replace("\n", "")
-    pure_answer = pure_answer.replace("*待纠错句子", "")
-    pure_answer = pure_answer.replace("*正确句子", "")
-    pure_answer = pure_answer.replace("*：,", "")
     return pure_answer.strip() or fallback
 
 
@@ -235,16 +198,12 @@ def run_csc_mode(
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    base_config = Qwen3_5Config.from_pretrained(args.model)
-    config_num_layers = getattr(base_config.text_config, "num_hidden_layers", None)
-    if config_num_layers is None:
-        raise ValueError("Cannot determine num_hidden_layers from Qwen3.5 config.")
-    adapter_layers = normalize_layer_indices(args.plug_idx, config_num_layers)
-    if hasattr(base_config, "text_config") and base_config.text_config is not None:
-        base_config.text_config.use_csc_adapter = True
-        base_config.text_config.csc_adapter_layers = list(adapter_layers)
-        base_config.text_config.use_cache = args.use_cache
-    base_config.use_cache = args.use_cache
+    base_config, _ = load_csc_config(
+        args.model,
+        adapter_layers=args.plug_idx,
+        use_cache=args.use_cache,
+        tokenizer=tokenizer,
+    )
     load_kwargs = {"trust_remote_code": True}#, "attn_implementation": args.attn_implementation}
     if torch.cuda.is_available():
         load_kwargs["device_map"] = "cuda"
@@ -253,9 +212,6 @@ def run_csc_mode(
         config=base_config,
         **load_kwargs,
     )
-    adapter_layers = normalize_layer_indices(adapter_layers, len(model.model.layers))
-    configure_csc_adapter(model, adapter_layers, args.use_cache)
-    ensure_csc_adapters(model, adapter_layers)
     model = model.eval()
     input_helper = InputHelper(
         tokenizer,
@@ -266,7 +222,6 @@ def run_csc_mode(
 
     preds = []
     for term in tqdm(data, desc="Correcting...", ncols=100):
-        # src_text = format_csc_input(term)
         pred = inference_csc(
             model=model,
             tokenizer=tokenizer,
@@ -281,10 +236,9 @@ def run_csc_mode(
 
 
 def build_csc_prompt(tokenizer: AutoTokenizer, text: str) -> str:
-    input_text = format_csc_input(text)
     messages = [
         {"role": "system", "content": INS2},
-        {"role": "user", "content": input_text},
+        {"role": "user", "content": text},
     ]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -338,26 +292,15 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--cache", type=str, default=None)
+    parser.add_argument("--plug_idx", nargs="+", type=int, default=[27,31], help="Layer indices to use CSC adapter")
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--max_length", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--plug_idx", nargs="+", type=int, default=[27], help="Layer indices to use CSC adapter")
-    parser.add_argument(
-        "--use_cache",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to use KV cache during generation",
-    )
-    parser.add_argument(
-        "--attn_implementation",
-        type=str,
-        default="flash_attention_2",
-        choices=["flash_attention_2", "sdpa", "eager"],
-        help="Attention implementation",
-    )
+    parser.add_argument("--use_cache",action=argparse.BooleanOptionalAction,default=True,help="Whether to use KV cache during generation")
+    parser.add_argument("--attn_implementation",type=str,default="flash_attention_2",choices=["flash_attention_2", "sdpa", "eager"],help="Attention implementation")
     args = parser.parse_args()
 
     with open(args.dataset, "r", encoding="utf-8") as f:

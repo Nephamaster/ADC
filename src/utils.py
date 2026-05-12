@@ -12,7 +12,7 @@ ROOT = FILE.parents[1]
 
 
 def is_chinese(uchar):
-    return '\u4e00' <= uchar <= '\u9fa5'
+    return len(uchar) == 1 and '\u4e00' <= uchar <= '\u9fa5'
 
 
 def is_float(string):
@@ -24,6 +24,9 @@ def is_float(string):
 
 
 def convert_char_to_image(character, font_size=32):
+    if not is_chinese(character):
+        return torch.zeros(font_size, font_size)
+
     font = ImageFont.truetype("src/ms_yahei.ttf", size=font_size)
 
     image = font.getmask(character)
@@ -41,7 +44,7 @@ def convert_char_to_image(character, font_size=32):
     return torch.tensor(image)
 
 
-def convert_char_to_pinyin(character, size=-1, tone=False):
+def convert_char_to_pinyin(character, size=6, tone=False):
     if not is_chinese(character):
         return torch.LongTensor([0] * max(size, 1))
 
@@ -64,8 +67,10 @@ def convert_char_to_pinyin(character, size=-1, tone=False):
     if size > len(embeddings):
         padding = torch.zeros(size - len(embeddings))
         embeddings = torch.concat([embeddings, padding])
+    elif size > 0:
+        embeddings = embeddings[:size]
 
-    return embeddings
+    return embeddings.long()
 
 
 def pred_token_process(src_tokens, pred_tokens, ignore_token: list = None):

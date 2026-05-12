@@ -1,12 +1,11 @@
 import json
-import torch
-
 from typing import Dict, List
+
+import torch
 from transformers import PreTrainedTokenizer
 
 from src.encoder import InputHelper
-from src.prompt import INS, INS2
-
+from src.prompt import INS2
 
 
 class DataCollatorForCSC:
@@ -14,54 +13,72 @@ class DataCollatorForCSC:
         self.tokenizer = tokenizer
         self.input_helper = input_helper
         self.max_length = max_length
+        self.im_start = "<|im_start|>"
+        self.im_end = "<|im_end|>"
+        self.non_thinking_prefix = "<think>\n\n</think>\n\n"
+
+    def _format_prefix(self, instruction: str) -> str:
+        return f"{self.im_start}system\n{instruction}{self.im_end}\n{self.im_start}user\n"
+
+    def _format_prompt(self, instruction: str, src_text: str) -> str:
+        return (
+            f"{self._format_prefix(instruction)}{src_text}{self.im_end}\n"
+            f"{self.im_start}assistant\n{self.non_thinking_prefix}"
+        )
+
+    def _format_answer(self, tgt_text) -> str:
+        if isinstance(tgt_text, (dict, list)):
+            tgt_text = json.dumps(tgt_text, ensure_ascii=False)
+        eos_token = self.tokenizer.eos_token or ""
+        return f"{tgt_text}{self.im_end}{eos_token}"
 
     def __call__(self, examples: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
-        prompts = [INS2 for ex in examples]
-        # prompts = INS
+        prompts = [INS2 for _ in examples]
         src_texts = [ex["src"] for ex in examples]
-        if isinstance(examples[0]["tgt"],(dict,list)):
-            tgt_texts = [json.dumps(ex["tgt"], ensure_ascii=False) + self.tokenizer.eos_token for ex in examples]
-        else:
-            tgt_texts = [ex["tgt"] + self.tokenizer.eos_token for ex in examples]
-        full_texts = [p + s + t for p, s, t in zip(prompts, src_texts, tgt_texts)]
-        prompt_len = len(self.tokenizer(prompts[0], add_special_tokens=False)["input_ids"])
+        prefix_texts = [self._format_prefix(prompt) for prompt in prompts]
+        prompt_texts = [self._format_prompt(prompt, src) for prompt, src in zip(prompts, src_texts)]
+        tgt_texts = [self._format_answer(ex["tgt"]) for ex in examples]
+        full_texts = [prompt + tgt for prompt, tgt in zip(prompt_texts, tgt_texts)]
 
         tokenized = self.tokenizer(
             full_texts,
             padding=True,
             truncation=True,
             max_length=self.max_length,
-            return_tensors="pt"
+            return_tensors="pt",
         )
         input_ids = tokenized["input_ids"]
         attention_mask = tokenized["attention_mask"]
         batch_size, seq_len = input_ids.shape
-        
-        # 仅 tgt 部分计算损失
+
         labels = input_ids.clone()
         for i in range(batch_size):
-            prompt_len = len(self.tokenizer(prompts[i], add_special_tokens=False).input_ids)
-            src_len = len(self.tokenizer(src_texts[i], add_special_tokens=False).input_ids)
-            has_bos = (self.tokenizer.bos_token_id is not None 
-                    and input_ids[i, 0].item() == self.tokenizer.bos_token_id)
+            prompt_len = len(self.tokenizer(prompt_texts[i], add_special_tokens=False).input_ids)
+            has_bos = (
+                self.tokenizer.bos_token_id is not None
+                and input_ids[i, 0].item() == self.tokenizer.bos_token_id
+            )
             bos_offset = 1 if has_bos else 0
-            tgt_start = bos_offset + prompt_len + src_len
-            tgt_start = min(tgt_start, seq_len)  # 安全边界
+            tgt_start = min(bos_offset + prompt_len, seq_len)
             labels[i, :tgt_start] = -100
-        labels = torch.where(labels == self.tokenizer.pad_token_id, -100, labels)
-        
-        # 与 input_ids 同形状
+
+        # Mask actual padding positions only. Do not mask by pad_token_id because
+        # Qwen commonly uses the same id for pad and eos, and eos must be learned.
+        labels = labels.masked_fill(attention_mask == 0, -100)
+
         pinyins = torch.zeros((batch_size, seq_len, 6), dtype=torch.long, device=input_ids.device)
         images = torch.zeros((batch_size, seq_len, 32, 32), dtype=torch.float32, device=input_ids.device)
-        
+
         for i in range(batch_size):
-            prompt_len = len(self.tokenizer(prompts[i], add_special_tokens=False).input_ids)
+            prefix_len = len(self.tokenizer(prefix_texts[i], add_special_tokens=False).input_ids)
             src_len = len(self.tokenizer(src_texts[i], add_special_tokens=False).input_ids)
-            has_bos = (self.tokenizer.bos_token_id is not None 
-                    and input_ids[i, 0].item() == self.tokenizer.bos_token_id)
+            has_bos = (
+                self.tokenizer.bos_token_id is not None
+                and input_ids[i, 0].item() == self.tokenizer.bos_token_id
+            )
             bos_offset = 1 if has_bos else 0
-            src_start = bos_offset + prompt_len
-            src_end = min(bos_offset + prompt_len + src_len, seq_len)
+            src_start = bos_offset + prefix_len
+            src_end = min(src_start + src_len, seq_len)
             if src_start >= src_end:
                 continue
             src_token_ids = input_ids[i, src_start:src_end]
@@ -75,5 +92,5 @@ class DataCollatorForCSC:
             "attention_mask": attention_mask,
             "phonetic_features": pinyins,
             "glyph_features": images,
-            "labels": labels
+            "labels": labels,
         }

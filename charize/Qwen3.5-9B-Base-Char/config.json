@@ -1,6 +1,6 @@
 {
   "architectures": [
-      "Qwen3_5ForConditionalGeneration"
+      "Qwen3_5ForCausalLM"
   ],
   "image_token_id": 200044,
   "model_type": "qwen3_5",

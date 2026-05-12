@@ -1,10 +1,11 @@
 import argparse
+import hashlib
+import json
 import os
 import torch
 import pickle
 from tqdm import tqdm
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoTokenizer, AutoConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 from src.utils import convert_char_to_pinyin, convert_char_to_image, pred_token_process
@@ -20,51 +21,98 @@ class InputHelper:
     """
     def __init__(self, tokenizer, cache_dir=None):
         self.tokenizer = tokenizer
-        self.cache_dir = cache_dir
+        self.cache_dir = cache_dir or "./cache"
+        self.cache_key = self._build_cache_key()
+        self.byte_decoder = self._get_byte_decoder()
         self.pinyin_embedding_cache = None
         self._init_pinyin_embedding_cache()
         self.token_images_cache = None
         self._init_token_images_cache()
 
+    @staticmethod
+    def _bytes_to_unicode() -> dict[int, str]:
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(161, 172 + 1))
+            + list(range(174, 255 + 1))
+        )
+        cs = bs[:]
+        n = 0
+        for b in range(256):
+            if b not in bs:
+                bs.append(b)
+                cs.append(256 + n)
+                n += 1
+        cs = [chr(c) for c in cs]
+        return dict(zip(bs, cs))
+
+    def _get_byte_decoder(self) -> dict[str, int]:
+        if hasattr(self.tokenizer, "byte_decoder"):
+            return self.tokenizer.byte_decoder
+        return {v: k for k, v in self._bytes_to_unicode().items()}
+
+    def _decode_token(self, token: str) -> str:
+        if token in getattr(self.tokenizer, "all_special_tokens", []):
+            return token
+        try:
+            return bytearray([self.byte_decoder[c] for c in token]).decode("utf-8", errors="replace")
+        except Exception:
+            return token
+
+    def _build_cache_key(self) -> str:
+        vocab = self.tokenizer.get_vocab()
+        special_tokens = getattr(self.tokenizer, "all_special_tokens", [])
+        payload = {
+            "name_or_path": getattr(self.tokenizer, "name_or_path", ""),
+            "vocab_size": len(vocab),
+            "special_tokens": special_tokens,
+            "sample": sorted(vocab.items(), key=lambda item: item[1])[:512],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:12]
+
+    def _cache_path(self, filename: str) -> str:
+        return os.path.join(self.cache_dir, f"{self.cache_key}_{filename}")
+
     def _init_pinyin_embedding_cache(self):
         self.pinyin_embedding_cache = {}
-        if os.path.exists(os.path.join(self.cache_dir,'pinyin_embedding_cache.pkl')):
+        cache_path = self._cache_path("pinyin_embedding_cache.pkl")
+        if os.path.exists(cache_path):
             print('Loading pinyin embedding cache...')
-            with open(os.path.join(self.cache_dir,'pinyin_embedding_cache.pkl'), 'rb') as f:
+            with open(cache_path, 'rb') as f:
                 self.pinyin_embedding_cache = pickle.load(f)
         else:
             for token, id in tqdm(self.tokenizer.get_vocab().items(), desc='Initializing pinyin embeddings cache...', ncols=100):
-                self.pinyin_embedding_cache[id] = convert_char_to_pinyin(token, tone=True)
+                decoded_token = self._decode_token(token)
+                self.pinyin_embedding_cache[id] = convert_char_to_pinyin(decoded_token, size=6, tone=True)
             os.makedirs(self.cache_dir, exist_ok=True)
-            with open(os.path.join(self.cache_dir,'pinyin_embedding_cache.pkl'), 'wb') as f:
+            with open(cache_path, 'wb') as f:
                 pickle.dump(self.pinyin_embedding_cache, f)
 
     def _init_token_images_cache(self):
         self.token_images_cache = {}
-        if os.path.exists(os.path.join(self.cache_dir,'token_image_cache.pkl')):
+        cache_path = self._cache_path("token_image_cache.pkl")
+        if os.path.exists(cache_path):
             print('Loading token images cache...')
-            with open(os.path.join(self.cache_dir,'token_image_cache.pkl'), 'rb') as f:
+            with open(cache_path, 'rb') as f:
                 self.token_images_cache = pickle.load(f)
         else:
             for token, id in tqdm(self.tokenizer.get_vocab().items(), desc='Initializing token images cache...', ncols=100):
-                self.token_images_cache[id] = convert_char_to_image(token, 32)
+                decoded_token = self._decode_token(token)
+                self.token_images_cache[id] = convert_char_to_image(decoded_token, 32)
             os.makedirs(self.cache_dir, exist_ok=True)
-            with open(os.path.join(self.cache_dir,'token_image_cache.pkl'), 'wb') as f:
+            with open(cache_path, 'wb') as f:
                 pickle.dump(self.token_images_cache, f)
 
     def convert_tokens_to_pinyin_embeddings(self, input_ids):
         input_pinyins = []
         for i, input_id in enumerate(input_ids):
-            input_pinyins.append(self.pinyin_embedding_cache.get(input_id.item(), torch.LongTensor([0])))
-        return pad_sequence(input_pinyins, batch_first=True)
+            input_pinyins.append(self.pinyin_embedding_cache.get(input_id.item(), torch.LongTensor([0] * 6)))
+        return torch.stack(input_pinyins)
 
     def convert_tokens_to_images(self, input_ids, characters):
         images = []
-        for i, input_id in enumerate(input_ids):
-            if input_id == 100:
-                if characters and i - 1 > 0 and i - 1 < len(characters):
-                    images.append(convert_char_to_image(characters[i - 1], 32))
-                    continue
+        for input_id in input_ids:
             images.append(self.token_images_cache.get(input_id.item(), torch.zeros(32, 32)))
         return torch.stack(images)
 
