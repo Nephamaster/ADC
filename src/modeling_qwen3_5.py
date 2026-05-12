@@ -14,6 +14,10 @@ from src.configuration_qwen_3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+try:
+    from transformers.cache_utils import DynamicLayer, LinearAttentionLayer
+except ImportError:
+    DynamicLayer, LinearAttentionLayer = None, None
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernelized_func
 from transformers.masking_utils import create_causal_mask
@@ -129,15 +133,139 @@ class Qwen3_5DynamicCache:
         The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
         """
         kv_offset = 0
-        query_length = cache_position.shape[0]
+        query_length = cache_position if isinstance(cache_position, int) else cache_position.shape[0]
         past_seen_tokens = self.get_seq_length(layer_idx)
         kv_length = query_length + past_seen_tokens
         return kv_length, kv_offset
 
-    @property
-    def has_previous_state(self):
+    def get_max_cache_shape(self, layer_idx: int = 0) -> int:
+        return -1
+
+    def has_previous_state(self, layer_idx: int | None = None) -> bool:
         """We have a previous state if the last linear (conv) layer was already updated."""
-        return self.conv_states[self.last_linear_layer] is not None
+        if layer_idx is None:
+            layer_idx = self.last_linear_layer
+        if layer_idx < 0 or layer_idx >= len(self.conv_states):
+            return False
+        return self.conv_states[layer_idx] is not None
+
+    def update_conv_state(self, conv_states: torch.Tensor, layer_idx: int, **kwargs) -> torch.Tensor:
+        self.conv_states[layer_idx] = conv_states
+        return self.conv_states[layer_idx]
+
+    def update_recurrent_state(self, recurrent_states: torch.Tensor, layer_idx: int, **kwargs) -> torch.Tensor:
+        self.recurrent_states[layer_idx] = recurrent_states
+        return self.recurrent_states[layer_idx]
+
+    def reset(self) -> None:
+        for layer_idx in range(len(self)):
+            self.conv_states[layer_idx] = None
+            self.recurrent_states[layer_idx] = None
+            self.key_cache[layer_idx] = None
+            self.value_cache[layer_idx] = None
+
+    def crop(self, max_length: int) -> None:
+        for layer_idx in range(len(self.key_cache)):
+            if self.key_cache[layer_idx] is not None:
+                self.key_cache[layer_idx] = self.key_cache[layer_idx][..., :max_length, :]
+                self.value_cache[layer_idx] = self.value_cache[layer_idx][..., :max_length, :]
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        for states in (self.key_cache, self.value_cache, self.conv_states, self.recurrent_states):
+            for layer_idx, state in enumerate(states):
+                if state is not None:
+                    states[layer_idx] = state.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        for states in (self.key_cache, self.value_cache, self.conv_states, self.recurrent_states):
+            for layer_idx, state in enumerate(states):
+                if state is not None:
+                    states[layer_idx] = state.index_select(0, indices.to(state.device))
+
+
+def _make_qwen3_5_cache(config: Qwen3_5TextConfig):
+    try:
+        cache = DynamicCache(config=config)
+        if _supports_qwen3_5_linear_cache(cache, config):
+            return cache
+    except Exception:
+        pass
+    if DynamicLayer is not None and LinearAttentionLayer is not None:
+        try:
+            layers = [
+                LinearAttentionLayer(config) if layer_type == "linear_attention" else DynamicLayer()
+                for layer_type in config.layer_types
+            ]
+            return Cache(layers=layers)
+        except Exception:
+            pass
+    return Qwen3_5DynamicCache(config=config)
+
+
+def _supports_qwen3_5_linear_cache(cache, config: Qwen3_5TextConfig) -> bool:
+    if isinstance(cache, Qwen3_5DynamicCache):
+        return True
+    if not all(hasattr(cache, name) for name in ("update_conv_state", "update_recurrent_state", "has_previous_state")):
+        return False
+    layers = getattr(cache, "layers", None)
+    if layers is None or len(layers) < config.num_hidden_layers:
+        return False
+    linear_layer_idx = next((idx for idx, layer_type in enumerate(config.layer_types) if layer_type == "linear_attention"), None)
+    if linear_layer_idx is None:
+        return True
+    linear_layer = layers[linear_layer_idx]
+    return hasattr(linear_layer, "conv_states") and hasattr(linear_layer, "recurrent_states")
+
+
+def _ensure_qwen3_5_cache(cache, config: Qwen3_5TextConfig):
+    if cache is None:
+        return _make_qwen3_5_cache(config)
+    if _supports_qwen3_5_linear_cache(cache, config):
+        return cache
+    logger.warning_once(
+        "Replacing an incompatible generation cache with Qwen3_5DynamicCache because Qwen3.5 linear attention "
+        "requires convolution and recurrent states."
+    )
+    return Qwen3_5DynamicCache(config=config)
+
+
+def _cache_has_previous_state(cache, layer_idx: int) -> bool:
+    if cache is None:
+        return False
+    has_previous_state = getattr(cache, "has_previous_state", None)
+    if callable(has_previous_state):
+        try:
+            return bool(has_previous_state(layer_idx))
+        except ValueError:
+            return False
+        except TypeError:
+            try:
+                return bool(has_previous_state())
+            except TypeError:
+                return False
+    if has_previous_state is not None:
+        return bool(has_previous_state)
+    layers = getattr(cache, "layers", None)
+    if layers is not None and layer_idx < len(layers):
+        return bool(getattr(layers[layer_idx], "has_previous_state", False))
+    conv_states = getattr(cache, "conv_states", None)
+    return conv_states is not None and layer_idx < len(conv_states) and conv_states[layer_idx] is not None
+
+
+def _get_conv_state(cache, layer_idx: int):
+    layers = getattr(cache, "layers", None)
+    if layers is not None and layer_idx < len(layers):
+        return getattr(layers[layer_idx], "conv_states", None)
+    conv_states = getattr(cache, "conv_states", None)
+    return None if conv_states is None else conv_states[layer_idx]
+
+
+def _get_recurrent_state(cache, layer_idx: int):
+    layers = getattr(cache, "layers", None)
+    if layers is not None and layer_idx < len(layers):
+        return getattr(layers[layer_idx], "recurrent_states", None)
+    recurrent_states = getattr(cache, "recurrent_states", None)
+    return None if recurrent_states is None else recurrent_states[layer_idx]
 
 
 class Qwen3_5TextRotaryEmbedding(nn.Module):
@@ -344,7 +472,7 @@ class Qwen3_5Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        # cache_position: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         input_shape = hidden_states.shape[:-1]
@@ -363,8 +491,8 @@ class Qwen3_5Attention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            # cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)#, cache_kwargs)
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -596,6 +724,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cache_params: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
@@ -604,24 +733,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         use_precomputed_states = (
             cache_params is not None
-            and cache_params.has_previous_state
-            and seq_len == 1
+            and _cache_has_previous_state(cache_params, self.layer_idx)
         )
         
-        if cache_params is not None:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            recurrent_state = cache_params.recurrent_states[self.layer_idx]
-
-        # if use_precomputed_states:
-        #     conv_state = cache_params.layers[self.layer_idx].conv_states
-        #     recurrent_state = cache_params.layers[self.layer_idx].recurrent_states
+        if use_precomputed_states:
+            conv_state = _get_conv_state(cache_params, self.layer_idx)
+            recurrent_state = _get_recurrent_state(cache_params, self.layer_idx)
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
         z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if use_precomputed_states:
+        if use_precomputed_states and seq_len == 1:
             mixed_qkv = self.causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -630,9 +754,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.activation,
             )
         else:
+            if use_precomputed_states:
+                mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
             if cache_params is not None:
                 conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
-                conv_state = cache_params.update_conv_state(conv_state, self.layer_idx)
+                cache_params.update_conv_state(conv_state, self.layer_idx)
             if self.causal_conv1d_fn is not None:
                 mixed_qkv = self.causal_conv1d_fn(
                     x=mixed_qkv,
@@ -642,7 +768,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     seq_idx=None,
                 )
             else:
-                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+                mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, : mixed_qkv.shape[-1]])
+            if use_precomputed_states:
+                mixed_qkv = mixed_qkv[:, :, -seq_len:]
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
@@ -656,18 +784,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=cache_params is not None,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
+        if use_precomputed_states and seq_len == 1:
             core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
                 query,
                 key,
@@ -675,6 +792,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 g=g,
                 beta=beta,
                 initial_state=recurrent_state,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state if use_precomputed_states else None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
             )
@@ -736,7 +864,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
-        # cache_position: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         phonetic_features: torch.Tensor | None = None,
         glyph_features: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
@@ -749,7 +877,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
             hidden_states = self.linear_attn(
                 hidden_states=hidden_states,
                 cache_params=past_key_values,
-                # cache_position=cache_position,
+                cache_position=cache_position,
                 attention_mask=attention_mask,
             )
         elif self.layer_type == "full_attention":
@@ -758,7 +886,7 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                # cache_position=cache_position,
+                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
@@ -873,27 +1001,27 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if use_cache and past_key_values is None:
-            past_key_values = Qwen3_5DynamicCache(config=self.config)
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if use_cache:
+            past_key_values = _ensure_qwen3_5_cache(past_key_values, self.config)
+        else:
+            past_key_values = None
 
-        if position_ids is None:
+        if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+        if position_ids is None:
+            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
             rope_position_ids = position_ids[1:]
-        # if position_ids is None:
-        #     position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
-        # elif position_ids.ndim == 2:
-        #     position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
-
-        # if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-        #     text_position_ids = position_ids[0]
-        #     position_ids = position_ids[1:]
         else:
             raise ValueError("Qwen3.5 text model expects 2D position ids or a [4, batch, seq] tensor.")
 
@@ -907,13 +1035,6 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 padding_mask = attention_mask.bool() if attention_mask.dtype != torch.bool else attention_mask
         
 
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens,
-            past_seen_tokens + inputs_embeds.shape[1],
-            device=inputs_embeds.device,
-        )
-        
         try:
             causal_mask = create_causal_mask(
                 config=self.config,
@@ -932,7 +1053,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 past_key_values=past_key_values,
                 position_ids=text_position_ids,
             )
-        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)#, cache_position)
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values, cache_position)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, rope_position_ids)
@@ -950,7 +1071,7 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 glyph_features=glyph_features,
                 padding_mask=padding_mask,
                 use_cache=use_cache,
-                # cache_position=cache_position,
+                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -960,10 +1081,13 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
         )
 
-    def _update_linear_attn_mask(self, attention_mask, past_key_values):
+    def _update_linear_attn_mask(self, attention_mask, past_key_values, cache_position):
         linear_attn_mask = attention_mask
+        last_linear_layer = len(self.config.layer_types) - 1 - self.config.layer_types[::-1].index("linear_attention")
 
-        if (past_key_values is not None and past_key_values.has_previous_state()) or (
+        if (past_key_values is not None and _cache_has_previous_state(past_key_values, last_linear_layer)) or (
+            cache_position is not None and cache_position[0] > 0
+        ) or (
             attention_mask is not None and torch.all(attention_mask == 1)
         ):
             linear_attn_mask = None
@@ -1010,7 +1134,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        # cache_position: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         phonetic_features: torch.Tensor | None = None,
         glyph_features: torch.Tensor | None = None,
@@ -1045,7 +1169,7 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            # cache_position=cache_position,
+            cache_position=cache_position,
             phonetic_features=phonetic_features,
             glyph_features=glyph_features,
             **kwargs,

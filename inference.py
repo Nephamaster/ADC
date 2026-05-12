@@ -266,13 +266,13 @@ def run_csc_mode(
 
     preds = []
     for term in tqdm(data, desc="Correcting...", ncols=100):
-        src_text = format_csc_input(term)
+        # src_text = format_csc_input(term)
         pred = inference_csc(
             model=model,
             tokenizer=tokenizer,
             input_helper=input_helper,
             instruction=INS2,
-            src_text=src_text,
+            src_text=term,
             max_length=args.max_length,
             device=device
         )
