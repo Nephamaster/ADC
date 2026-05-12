@@ -8,3 +8,7 @@ data/train/
 data/wang271k/
 
 LOG.md
+
+evaluation.sh
+inference.sh
+train.sh
