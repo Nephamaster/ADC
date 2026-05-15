@@ -9,6 +9,7 @@ from src.csc_config import load_csc_config
 from src.data_collator import DataCollatorForCSC
 from src.encoder import InputHelper
 from src.modeling_qwen3_5 import Qwen3_5ForCausalLM
+from src.modeling_qwen3 import Qwen3ForCausalLM
 
 
 def is_main_process() -> bool:
@@ -50,7 +51,7 @@ def train(args):
         tokenizer=tokenizer,
     )
 
-    plugin = Qwen3_5ForCausalLM.from_pretrained(
+    plugin = Qwen3ForCausalLM.from_pretrained(
         args.model,
         config=base_config,
         # attn_implementation=args.attn_implementation,

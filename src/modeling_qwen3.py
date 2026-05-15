@@ -317,7 +317,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.use_csc_adapter = getattr(config, 'use_csc_adapter', False)
         self.csc_adapter_layer_idx = getattr(config, 'csc_adapter_layers', [])
         if self.use_csc_adapter and layer_idx in self.csc_adapter_layer_idx:
-            from models.adapter import CSCAdapter
+            from src.adapter import CSCAdapter
             self.csc_adapter = CSCAdapter(config)
         else:
             self.csc_adapter = None

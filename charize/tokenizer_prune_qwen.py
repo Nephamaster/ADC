@@ -131,36 +131,63 @@ def build_reindexed_vocab_and_mapping(vocab: dict[str, int], removed_token_ids: 
     return new_vocab, new2old
 
 
+def collect_single_chinese_dependencies(
+    vocab: dict[str, int], merges: list[tuple[str, str]], byte_decoder: dict[str, int]
+) -> tuple[set[str], set[int]]:
+    """
+    Protect merges needed to build single Chinese-character tokens.
+    Byte-level BPE may use invalid standalone UTF-8 fragments internally.
+    """
+    merge_by_result = {a + b: (a, b, merge_idx) for merge_idx, (a, b) in enumerate(merges)}
+    protected_tokens: set[str] = set()
+    protected_merge_idx: set[int] = set()
+
+    def protect(token: str):
+        if token in protected_tokens:
+            return
+        protected_tokens.add(token)
+
+        merge = merge_by_result.get(token)
+        if merge is None:
+            return
+
+        a, b, merge_idx = merge
+        protected_merge_idx.add(merge_idx)
+        protect(a)
+        protect(b)
+
+    for token in vocab:
+        decoded = decode_bpe_piece(token, byte_decoder)
+        if len(decoded) == 1 and is_chinese_string(decoded):
+            protect(token)
+
+    return protected_tokens, protected_merge_idx
+
+
 def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = True):
     tokenizer = AutoTokenizer.from_pretrained(old_model_path)
     tokenizer_json, vocab, merges = extract_bpe_state(tokenizer)
     byte_decoder = get_byte_decoder(tokenizer)
+    protected_tokens, protected_merge_idx = collect_single_chinese_dependencies(vocab, merges, byte_decoder)
 
     need_to_delete_words = set()
     need_to_delete_word_ids = set()
     for token, token_id in vocab.items():
         decoded = decode_bpe_piece(token, byte_decoder)
-        if len(decoded) > 1 and is_chinese_string(decoded):
+        if len(decoded) > 1 and is_chinese_string(decoded) and token not in protected_tokens:
             need_to_delete_words.add(decoded)
             need_to_delete_word_ids.add(token_id)
             print(f"DELETE WORD {decoded}")
     print(len(need_to_delete_word_ids), "chinese words to delete")
 
-    removed_token_strs = {token for token, token_id in vocab.items() if token_id in need_to_delete_word_ids}
     need_to_delete_merge_idx = set()
     for merge_idx, (a, b) in enumerate(merges):
+        if merge_idx in protected_merge_idx:
+            continue
+
         merged = a + b
-        da = decode_bpe_piece(a, byte_decoder)
-        db = decode_bpe_piece(b, byte_decoder)
         dab = decode_bpe_piece(merged, byte_decoder)
-        if (
-            dab in need_to_delete_words
-            or da in need_to_delete_words
-            or db in need_to_delete_words
-            or a in removed_token_strs
-            or b in removed_token_strs
-            or merged in removed_token_strs
-        ):
+        if len(dab) > 1 and is_chinese_string(dab):
             need_to_delete_merge_idx.add(merge_idx)
             print(f"DELETE MERGE {dab}")
     print(len(need_to_delete_merge_idx), "merges to delete")
@@ -194,11 +221,16 @@ def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = T
 def main(old_model_path: str, new_model_path: str):
     text = "\u8fd9\u662f\u4e00\u4e2a\u4e2d\u6587\u5206\u8bcd\u6d4b\u8bd5"
     tokenizer_old = AutoTokenizer.from_pretrained(old_model_path)
-    print([tokenizer_old.decode(_id) for _id in tokenizer_old.encode(text)])
+    ids = tokenizer_old.encode(text)
+    pieces = [tokenizer_old.decode([_id]) for _id in ids]
+    print(pieces)
     print(len(tokenizer_old))
 
     tokenizer_new = AutoTokenizer.from_pretrained(new_model_path)
-    print([tokenizer_new.decode(_id) for _id in tokenizer_new.encode(text)])
+    ids = tokenizer_new.encode(text)
+    print(tokenizer_new.convert_ids_to_tokens(ids))
+    print([tokenizer_new.decode([_id]) for _id in ids])
+    print(tokenizer_new.decode(ids))
     print(len(tokenizer_new))
 
 
@@ -208,5 +240,5 @@ if __name__ == "__main__":
     parser.add_argument("--new_model_path", type=str, required=True)
 
     args = parser.parse_args()
-    prune(args.old_model_path, args.new_model_path, prune_vocab_tokens=True)
+    prune(args.old_model_path, args.new_model_path, prune_vocab_tokens=False)
     main(args.old_model_path, args.new_model_path)

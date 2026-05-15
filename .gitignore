@@ -12,3 +12,5 @@ LOG.md
 evaluation.sh
 inference.sh
 train.sh
+
+*.bak

@@ -6,6 +6,8 @@ from typing import Callable, Optional, Tuple
 from src.encoder import PhoneticEncoder, GlyphEncoder
 from src.modeling_qwen3_5 import apply_rotary_pos_emb, repeat_kv, Qwen3_5RMSNorm
 from src.configuration_qwen3_5 import Qwen3_5Config
+from src.modeling_qwen3 import apply_rotary_pos_emb, repeat_kv, Qwen3RMSNorm
+from src.configuration_qwen3 import Qwen3Config
 
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -36,7 +38,7 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-class CrossAttention(nn.Module):
+class CrossAttention35(nn.Module):
     """Qwen3.5-style gated full attention, with KV from multimodal features."""
 
     def __init__(self, config: Qwen3_5Config):
@@ -129,6 +131,99 @@ class CrossAttention(nn.Module):
         return attn_output, attn_weights
 
 
+class CrossAttention(nn.Module):
+    """Qwen3-style gated full attention, with KV from multimodal features."""
+
+    def __init__(self, config: Qwen3Config):
+        super().__init__()
+        self.config = config
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_feature: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        # cache_position: Optional[torch.LongTensor] = None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states, gate = torch.chunk(
+            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+        )
+        gate = gate.reshape(*input_shape, -1)
+
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(multimodal_feature).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(multimodal_feature).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        # Normalize mask for both eager and SDPA attention backends.
+        # Expected output is additive mask in shape [bsz, 1, q_len, k_len]:
+        #   0 for keep, large negative for masked.
+        if attention_mask is not None:
+            q_len = query_states.shape[-2]
+            k_len = key_states.shape[-2]
+            mask_dtype = query_states.dtype
+            neg_value = torch.finfo(mask_dtype).min
+            if attention_mask.dim() == 2:
+                # [bsz, k_len], usually 1/0 or bool (1/True = valid token).
+                key_valid = attention_mask.to(device=query_states.device).bool()
+                key_valid = key_valid[:, None, None, :]  # [bsz, 1, 1, k_len]
+                attention_mask = (~key_valid).to(dtype=mask_dtype) * neg_value
+            elif attention_mask.dim() == 4:
+                attention_mask = attention_mask.to(device=query_states.device)
+                if attention_mask.dtype == torch.bool:
+                    attention_mask = attention_mask.logical_not().to(dtype=mask_dtype) * neg_value
+                else:
+                    attention_mask = attention_mask.to(dtype=mask_dtype)
+            else:
+                raise ValueError(f"Unsupported attention_mask dim in CrossAttention: {attention_mask.dim()}")
+            attention_mask = attention_mask[:, :, :q_len, :k_len]
+
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class CSCAdapter(nn.Module):
     """
     插入位置：Qwen3DecoderLayer的Attention之后、MLP之前
@@ -142,15 +237,15 @@ class CSCAdapter(nn.Module):
         self.glyph_encoder = GlyphEncoder(self.hidden_size, font_size=32, dropout=dropout)
         self.modal_fusion = nn.Sequential(
             nn.Linear(self.hidden_size*2, self.hidden_size, bias=False),
-            Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps),
+            Qwen3RMSNorm(self.hidden_size, eps=config.rms_norm_eps),
             ACT2FN[config.hidden_act],  # SwiGLU
             nn.Dropout(dropout),
         )
         self.cross_attention = CrossAttention(config=config)
 
         self.gate_proj = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
-        self.gate_norm = Qwen3_5RMSNorm(self.hidden_size * 2, eps=config.rms_norm_eps)
-        self.norm1 = Qwen3_5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.gate_norm = Qwen3RMSNorm(self.hidden_size * 2, eps=config.rms_norm_eps)
+        self.norm1 = Qwen3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
     
     def forward(
