@@ -22,6 +22,17 @@ class VocabularyPruner(object):
         return mapping
 
     @staticmethod
+    def _load_init_token_ids_from_tokenizer_dir(new_tokenizer_name_or_path: str) -> Dict[int, list[int]]:
+        init_path = os.path.join(new_tokenizer_name_or_path, "new_token_init_token_ids.json")
+        if not os.path.exists(init_path):
+            return {}
+        with open(init_path, "rt", encoding="utf-8") as f:
+            raw = json.load(f)
+        init_token_ids = {int(k): [int(v) for v in values] for k, values in raw.items()}
+        print(f"Loaded new-token init ids from: {init_path}, size={len(init_token_ids)}")
+        return init_token_ids
+
+    @staticmethod
     def _build_mapping_from_vocab(old_vocab: Dict[str, int], new_vocab: Dict[str, int]) -> Dict[int, int]:
         mapping: Dict[int, int] = {}
         for token, new_id in new_vocab.items():
@@ -31,26 +42,50 @@ class VocabularyPruner(object):
         return mapping
 
     @staticmethod
-    def _validate_mapping(mapping: Dict[int, int], old_vocab_size: int, new_vocab_size: int):
-        if len(mapping) != new_vocab_size:
-            raise ValueError(f"Mapping size mismatch: mapping={len(mapping)} new_vocab={new_vocab_size}")
-        missing_new_ids = [i for i in range(new_vocab_size) if i not in mapping]
+    def _validate_mapping(
+        mapping: Dict[int, int],
+        init_token_ids: Dict[int, list[int]],
+        old_vocab_size: int,
+        new_vocab_size: int,
+    ):
+        covered_new_ids = set(mapping) | set(init_token_ids)
+        if len(covered_new_ids) != new_vocab_size:
+            raise ValueError(
+                f"Mapping size mismatch: copied={len(mapping)} initialized={len(init_token_ids)} "
+                f"new_vocab={new_vocab_size}"
+            )
+        missing_new_ids = [i for i in range(new_vocab_size) if i not in covered_new_ids]
         if missing_new_ids:
             raise ValueError(f"Mapping missing new ids, head={missing_new_ids[:20]}")
         bad_old_ids = [old_id for old_id in mapping.values() if old_id < 0 or old_id >= old_vocab_size]
         if bad_old_ids:
             raise ValueError(f"Mapping has out-of-range old ids, head={bad_old_ids[:20]}")
+        bad_init_old_ids = [
+            old_id
+            for old_ids in init_token_ids.values()
+            for old_id in old_ids
+            if old_id < 0 or old_id >= old_vocab_size
+        ]
+        if bad_init_old_ids:
+            raise ValueError(f"Init mapping has out-of-range old ids, head={bad_init_old_ids[:20]}")
 
     @staticmethod
     def _augment_mapping_with_vocab_alignment(
-        mapping: Dict[int, int], old_vocab: Dict[str, int], new_vocab: Dict[str, int]
+        mapping: Dict[int, int],
+        init_token_ids: Dict[int, list[int]],
+        old_vocab: Dict[str, int],
+        new_vocab: Dict[str, int],
     ) -> Dict[int, int]:
         """
         Fill missing new_id entries (typically added/special tokens not present in base BPE vocab mapping)
         by token-string alignment against old_vocab.
         """
         completed = dict(mapping)
-        missing_new_ids = [new_id for new_id in range(len(new_vocab)) if new_id not in completed]
+        missing_new_ids = [
+            new_id
+            for new_id in range(len(new_vocab))
+            if new_id not in completed and new_id not in init_token_ids
+        ]
         if not missing_new_ids:
             return completed
 
@@ -106,7 +141,7 @@ class VocabularyPruner(object):
         print("input_embed_equal:", torch.equal(old_in, new_in))
         print("output_embed_equal:", torch.equal(old_out, new_out))
 
-    def update_embeddings(self, model, new2old_token_id, new_embeds, new_lm_head):
+    def update_embeddings(self, model, new2old_token_id, init_token_ids, new_embeds, new_lm_head):
         raise NotImplementedError
 
     def prune(self, model_name_or_path, new_tokenizer_name_or_path, save_path, new_name_or_path=None):
@@ -121,15 +156,23 @@ class VocabularyPruner(object):
         new_vocab = new_tokenizer.get_vocab()
 
         mapping = self._load_mapping_from_tokenizer_dir(new_tokenizer_name_or_path)
+        init_token_ids = self._load_init_token_ids_from_tokenizer_dir(new_tokenizer_name_or_path)
         if mapping is None:
             print("new2old_token_id.json not found; fallback to token-string alignment mapping")
             mapping = self._build_mapping_from_vocab(old_vocab, new_vocab)
         else:
-            mapping = self._augment_mapping_with_vocab_alignment(mapping, old_vocab, new_vocab)
+            mapping = self._augment_mapping_with_vocab_alignment(mapping, init_token_ids, old_vocab, new_vocab)
 
-        self._validate_mapping(mapping, old_vocab_size=len(old_vocab), new_vocab_size=len(new_vocab))
+        self._validate_mapping(
+            mapping,
+            init_token_ids,
+            old_vocab_size=len(old_vocab),
+            new_vocab_size=len(new_vocab),
+        )
 
         for token, new_id in tqdm(new_vocab.items(), desc="validate_token_mapping"):
+            if int(new_id) in init_token_ids:
+                continue
             old_id_by_token = old_vocab.get(token)
             if old_id_by_token is None:
                 raise ValueError(f"token missing in old vocab: {token}")
@@ -153,7 +196,7 @@ class VocabularyPruner(object):
         new_embeds = torch.nn.Embedding(vocab_size, hidden_size, dtype=model.dtype)
         new_lm_head = torch.nn.Linear(in_features=hidden_size, out_features=vocab_size, bias=False, dtype=model.dtype)
 
-        self.update_embeddings(model, mapping, new_embeds, new_lm_head)
+        self.update_embeddings(model, mapping, init_token_ids, new_embeds, new_lm_head)
 
         model.config.vocab_size = vocab_size
         if new_name_or_path is not None:
@@ -190,13 +233,17 @@ class VocabularyPruner(object):
 
 class ModelVocabularyPruner(VocabularyPruner):
 
-    def update_embeddings(self, model, new2old_token_id: Dict[int, int], new_embeds, new_lm_head):
+    def update_embeddings(self, model, new2old_token_id: Dict[int, int], init_token_ids: Dict[int, list[int]], new_embeds, new_lm_head):
         input_weight = model.get_input_embeddings().weight.data
         output_weight = model.get_output_embeddings().weight.data
-        for new_id in tqdm(range(len(new2old_token_id)), desc="copy_embeddings"):
-            old_id = new2old_token_id[new_id]
+        for new_id, old_id in tqdm(sorted(new2old_token_id.items()), desc="copy_embeddings"):
             new_embeds.weight.data[new_id] = input_weight[old_id]
             new_lm_head.weight.data[new_id] = output_weight[old_id]
+
+        for new_id, old_ids in tqdm(init_token_ids.items(), desc="init_new_embeddings"):
+            old_id_tensor = torch.tensor(old_ids, dtype=torch.long, device=input_weight.device)
+            new_embeds.weight.data[new_id] = input_weight.index_select(0, old_id_tensor).mean(dim=0)
+            new_lm_head.weight.data[new_id] = output_weight.index_select(0, old_id_tensor).mean(dim=0)
 
         model.set_input_embeddings(new_embeds)
         model.set_output_embeddings(new_lm_head)

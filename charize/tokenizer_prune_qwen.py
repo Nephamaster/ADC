@@ -33,6 +33,10 @@ def get_byte_decoder(tokenizer) -> dict[str, int]:
     return {v: k for k, v in bytes_to_unicode().items()}
 
 
+def get_byte_encoder(tokenizer) -> dict[int, str]:
+    return {v: k for k, v in get_byte_decoder(tokenizer).items()}
+
+
 def decode_bpe_piece(piece: str, byte_decoder: dict[str, int]) -> str:
     try:
         return bytearray([byte_decoder[c] for c in piece]).decode("utf-8", errors="replace")
@@ -135,8 +139,9 @@ def collect_single_chinese_dependencies(
     vocab: dict[str, int], merges: list[tuple[str, str]], byte_decoder: dict[str, int]
 ) -> tuple[set[str], set[int]]:
     """
-    Protect merges needed to build single Chinese-character tokens.
-    Byte-level BPE may use invalid standalone UTF-8 fragments internally.
+    Protect every merge needed to build single Han-character tokens.
+    Byte-level BPE often needs incomplete UTF-8 byte fragments as intermediate
+    pieces before it can form one complete Han character.
     """
     merge_by_result = {a + b: (a, b, merge_idx) for merge_idx, (a, b) in enumerate(merges)}
     protected_tokens: set[str] = set()
@@ -164,10 +169,100 @@ def collect_single_chinese_dependencies(
     return protected_tokens, protected_merge_idx
 
 
+def filter_merges_by_vocab(merges: list[tuple[str, str]], vocab: dict[str, int]) -> list[tuple[str, str]]:
+    """
+    Hugging Face tokenizers validates that every token referenced by a merge is
+    present in the BPE vocab. After pruning vocab entries, remove dangling merges.
+    """
+    vocab_tokens = set(vocab)
+    filtered_merges: list[tuple[str, str]] = []
+    dangling_count = 0
+    for a, b in merges:
+        if a in vocab_tokens and b in vocab_tokens and (a + b) in vocab_tokens:
+            filtered_merges.append((a, b))
+        else:
+            dangling_count += 1
+    print(dangling_count, "dangling merges removed")
+    return filtered_merges
+
+
+def encode_text_as_bpe_piece(text: str, byte_encoder: dict[int, str]) -> str:
+    return "".join(byte_encoder[b] for b in text.encode("utf-8"))
+
+
+def ensure_single_chinese_bpe_paths(
+    old_tokenizer,
+    old_vocab: dict[str, int],
+    pruned_vocab: dict[str, int],
+    new2old: dict[int, int],
+    pruned_merges: list[tuple[str, str]],
+    candidate_chars: set[str],
+    byte_encoder: dict[int, str],
+) -> tuple[list[tuple[str, str]], dict[int, list[int]]]:
+    """
+    Make each candidate Han character reachable as one byte-level BPE token.
+    Required character-completion merges are promoted to the front so they beat
+    cross-character byte merges such as "æµ" + "ĭè¯ķ".
+    """
+    existing_merges = set(pruned_merges)
+    promoted_merges: list[tuple[str, str]] = []
+    promoted_merge_set: set[tuple[str, str]] = set()
+    init_token_ids: dict[int, list[int]] = {}
+    added_token_count = 0
+
+    def add_vocab_token(token: str, old_ids: list[int]) -> None:
+        nonlocal added_token_count
+        if token in pruned_vocab:
+            return
+        new_id = len(pruned_vocab)
+        pruned_vocab[token] = new_id
+        added_token_count += 1
+        if token in old_vocab:
+            new2old[new_id] = int(old_vocab[token])
+        else:
+            init_token_ids[new_id] = [int(old_id) for old_id in old_ids]
+
+    for char in sorted(candidate_chars):
+        piece = encode_text_as_bpe_piece(char, byte_encoder)
+        if len(piece) <= 1:
+            continue
+
+        old_char_ids = [int(old_id) for old_id in old_tokenizer.encode(char, add_special_tokens=False)]
+        for byte_piece in piece:
+            if byte_piece not in pruned_vocab:
+                add_vocab_token(byte_piece, [int(old_vocab[byte_piece])])
+
+        acc = piece[0]
+        for part in piece[1:]:
+            merged = acc + part
+            add_vocab_token(merged, old_char_ids)
+            merge = (acc, part)
+            if merge not in promoted_merge_set:
+                promoted_merges.append(merge)
+                promoted_merge_set.add(merge)
+            acc = merged
+
+    pruned_merges = promoted_merges + [
+        merge for merge in pruned_merges if merge not in promoted_merge_set and merge in existing_merges
+    ]
+    print(added_token_count, "single chinese bpe tokens added")
+    print(len(promoted_merges), "single chinese bpe merges promoted")
+    return pruned_merges, init_token_ids
+
+
+def write_init_token_ids(new_model_path: str, init_token_ids: dict[int, list[int]]) -> None:
+    if not init_token_ids:
+        return
+    with open(os.path.join(new_model_path, "new_token_init_token_ids.json"), "wt", encoding="utf-8") as f:
+        json.dump(init_token_ids, f, ensure_ascii=False, indent=2)
+    print(len(init_token_ids), "new token embedding init entries written")
+
+
 def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = True):
     tokenizer = AutoTokenizer.from_pretrained(old_model_path)
     tokenizer_json, vocab, merges = extract_bpe_state(tokenizer)
     byte_decoder = get_byte_decoder(tokenizer)
+    byte_encoder = get_byte_encoder(tokenizer)
     protected_tokens, protected_merge_idx = collect_single_chinese_dependencies(vocab, merges, byte_decoder)
 
     need_to_delete_words = set()
@@ -198,6 +293,21 @@ def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = T
         pruned_vocab = vocab
         new2old = {old_id: old_id for old_id in sorted(vocab.values())}
     pruned_merges = [merge for i, merge in enumerate(merges) if i not in need_to_delete_merge_idx]
+    pruned_merges = filter_merges_by_vocab(pruned_merges, pruned_vocab)
+
+    init_token_ids: dict[int, list[int]] = {}
+    candidate_chars = {char for word in need_to_delete_words for char in word if is_chinese_char(char)}
+    if prune_vocab_tokens:
+        pruned_merges, init_token_ids = ensure_single_chinese_bpe_paths(
+            tokenizer,
+            vocab,
+            pruned_vocab,
+            new2old,
+            pruned_merges,
+            candidate_chars,
+            byte_encoder,
+        )
+        pruned_merges = filter_merges_by_vocab(pruned_merges, pruned_vocab)
 
     os.makedirs(new_model_path, exist_ok=True)
     tokenizer.save_pretrained(new_model_path)
@@ -209,6 +319,7 @@ def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = T
         f.write("\n")
     with open(os.path.join(new_model_path, "new2old_token_id.json"), "wt", encoding="utf-8") as f:
         json.dump(new2old, f, ensure_ascii=False, indent=2)
+    write_init_token_ids(new_model_path, init_token_ids)
 
     # New Transformers loads tokenizer.json first when present, so patch it too.
     if tokenizer_json is not None:
@@ -221,16 +332,17 @@ def prune(old_model_path: str, new_model_path: str, prune_vocab_tokens: bool = T
 def main(old_model_path: str, new_model_path: str):
     text = "\u8fd9\u662f\u4e00\u4e2a\u4e2d\u6587\u5206\u8bcd\u6d4b\u8bd5"
     tokenizer_old = AutoTokenizer.from_pretrained(old_model_path)
-    ids = tokenizer_old.encode(text)
-    pieces = [tokenizer_old.decode([_id]) for _id in ids]
-    print(pieces)
+    old_ids = tokenizer_old.encode(text, add_special_tokens=False)
+    print(tokenizer_old.convert_ids_to_tokens(old_ids))
+    print([tokenizer_old.decode([_id]) for _id in old_ids])
+    print(tokenizer_old.decode(old_ids))
     print(len(tokenizer_old))
 
     tokenizer_new = AutoTokenizer.from_pretrained(new_model_path)
-    ids = tokenizer_new.encode(text)
-    print(tokenizer_new.convert_ids_to_tokens(ids))
-    print([tokenizer_new.decode([_id]) for _id in ids])
-    print(tokenizer_new.decode(ids))
+    new_ids = tokenizer_new.encode(text, add_special_tokens=False)
+    print(tokenizer_new.convert_ids_to_tokens(new_ids))
+    print([tokenizer_new.decode([_id]) for _id in new_ids])
+    print(tokenizer_new.decode(new_ids))
     print(len(tokenizer_new))
 
 
@@ -240,5 +352,5 @@ if __name__ == "__main__":
     parser.add_argument("--new_model_path", type=str, required=True)
 
     args = parser.parse_args()
-    prune(args.old_model_path, args.new_model_path, prune_vocab_tokens=False)
+    prune(args.old_model_path, args.new_model_path, prune_vocab_tokens=True)
     main(args.old_model_path, args.new_model_path)

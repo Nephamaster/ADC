@@ -191,6 +191,7 @@ def run_csc_mode(
 ) -> List[str]:
     from src.encoder import InputHelper
     from src.modeling_qwen3_5 import Qwen3_5ForCausalLM
+    from src.modeling_qwen3 import Qwen3ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
@@ -207,7 +208,7 @@ def run_csc_mode(
     load_kwargs = {"trust_remote_code": True}#, "attn_implementation": args.attn_implementation}
     if torch.cuda.is_available():
         load_kwargs["device_map"] = "cuda"
-    model = Qwen3_5ForCausalLM.from_pretrained(
+    model = Qwen3ForCausalLM.from_pretrained(
         args.model,
         config=base_config,
         **load_kwargs,
